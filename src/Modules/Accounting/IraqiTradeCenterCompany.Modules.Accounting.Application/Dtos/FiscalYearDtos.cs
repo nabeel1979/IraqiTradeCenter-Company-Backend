@@ -44,6 +44,28 @@ public class FiscalYearStatusDto
     public decimal TotalDebits { get; set; }
     public decimal TotalCredits { get; set; }
     public bool IsBalanced { get; set; }
+
+    /// <summary>السنة الهدف التالية زمنياً (لتدوير الأرصدة من سنة مغلقة).</summary>
+    public int? RolloverTargetFiscalYearId { get; set; }
+    public string? RolloverTargetFiscalYearName { get; set; }
+    public string? RolloverTargetFiscalYearNameEn { get; set; }
+    /// <summary>هل وُجد قيد/قيود افتتاحية في السنة الهدف (تدوير سابق).</summary>
+    public bool HasRolloverOpeningEntries { get; set; }
+    public int RolloverOpeningEntriesCount { get; set; }
+
+    /// <summary>سنوات يمكن إلغاء التدوير إليها (قيد افتتاحي موجود في السنة الهدف).</summary>
+    public List<RolloverUndoTargetDto> RolloverUndoTargets { get; set; } = new();
+}
+
+public class RolloverUndoTargetDto
+{
+    public int TargetFiscalYearId { get; set; }
+    public string TargetFiscalYearName { get; set; } = default!;
+    public string? TargetFiscalYearNameEn { get; set; }
+    public int OpeningEntriesCount { get; set; }
+    public int? SourceFiscalYearId { get; set; }
+    public string? SourceFiscalYearName { get; set; }
+    public string? SourceFiscalYearNameEn { get; set; }
 }
 
 public class FiscalYearValidationDto
@@ -85,6 +107,10 @@ public class FiscalYearRolloverResultDto
     public int ToFiscalYearId { get; set; }
     public int BalanceSheetAccountsRolled { get; set; }
     public decimal RetainedEarningsTransferred { get; set; }
+    /// <summary>عدد القيود الافتتاحية المُنشأة (قيد لكل عملة في وضع الاستقلال، أو قيد واحد في وضع التحويل).</summary>
+    public int OpeningEntriesCreated { get; set; }
+    /// <summary>معرّف النشرة المُدوَّرة إلى السنة الجديدة (إن أُنشئت).</summary>
+    public int? RolledBulletinId { get; set; }
     public string Message { get; set; } = default!;
 }
 

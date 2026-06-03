@@ -6,8 +6,8 @@ using Microsoft.EntityFrameworkCore;
 namespace IraqiTradeCenterCompany.Modules.Accounting.Application.Features.FiscalYearManagement;
 
 /// <summary>
-/// تفعيل سنة مالية كـ"نشطة" — تُلغى تلقائياً تفعيل بقية السنوات
-/// لضمان وجود سنة واحدة فقط نشطة في كل وقت. لا يُسمح بتفعيل سنة مغلقة.
+/// تفعيل سنة مالية كـ"نشطة" للتقارير والقراءة — تُلغى تلقائياً تفعيل بقية السنوات.
+/// مسموح حتى للسنة المغلقة (الإقفال يمنع القيود لا العرض).
 /// </summary>
 public record ActivateFiscalYearCommand(int FiscalYearId) : IRequest<Unit>;
 
@@ -20,9 +20,6 @@ public class ActivateFiscalYearHandler : IRequestHandler<ActivateFiscalYearComma
     {
         var target = await _db.FiscalYears.FirstOrDefaultAsync(f => f.Id == req.FiscalYearId, ct)
             ?? throw new DomainException("السنة المالية غير موجودة");
-
-        if (target.IsClosed)
-            throw new DomainException("لا يمكن تفعيل سنة مالية مغلقة. الرجاء فك إغلاقها أولاً.");
 
         // ‎إلغاء تفعيل أي سنة أخرى نشطة حالياً
         var others = await _db.FiscalYears
@@ -49,8 +46,11 @@ public class GetActiveFiscalYearHandler : IRequestHandler<GetActiveFiscalYearQue
 
     public async Task<Dtos.FiscalYearDto?> Handle(GetActiveFiscalYearQuery req, CancellationToken ct)
     {
+        // ‎عند وجود أكثر من سنة نشطة (بيانات قديمة): الأحدث بدايةً.
         var fy = await _db.FiscalYears.AsNoTracking()
-            .FirstOrDefaultAsync(f => f.IsActive, ct);
+            .Where(f => f.IsActive)
+            .OrderByDescending(f => f.StartDate)
+            .FirstOrDefaultAsync(ct);
         if (fy is null) return null;
 
         return new Dtos.FiscalYearDto

@@ -1,3 +1,4 @@
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.SharedKernel.Exceptions;
 using IraqiTradeCenterCompany.SharedKernel.Models;
@@ -17,6 +18,9 @@ public class UpdateAccountHandler : IRequestHandler<UpdateAccountCommand, Result
         {
             var account = await _db.Accounts.FirstOrDefaultAsync(a => a.Id == req.Id, ct);
             if (account is null) return Result.Failure("الحساب غير موجود");
+
+            if (await FinancialManagementAccountGuard.IsManagedAccountAsync(_db, req.Id, ct))
+                return Result.Failure(FinancialManagementAccountGuard.ManagedAccountMessage);
 
             if (string.IsNullOrWhiteSpace(req.NameAr))
                 return Result.Failure("اسم الحساب مطلوب");

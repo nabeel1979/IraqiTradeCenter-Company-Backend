@@ -1,5 +1,6 @@
 using System.Text.Json;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Dtos;
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using MediatR;
@@ -16,6 +17,7 @@ public record GetAccountStatementQuery(
     int? AccountId = null,
     string? Currency = null,
     bool IncludeDraft = false,
+    bool IncludeOpeningEntries = true,
     string? BaseCurrency = null,
     string? ExchangeRatesJson = null
 ) : IRequest<AccountStatementDto>;
@@ -115,6 +117,8 @@ public class GetAccountStatementHandler : IRequestHandler<GetAccountStatementQue
             if (activeFy != null) plFyStart = activeFy.StartDate.Date;
         }
 
+        var includePriorOpening = !plFyStart.HasValue || fromDate > plFyStart.Value;
+
         // ─────────────────────────────────────────
         // المصدر الأساسي لأسعار الصرف: أحدث نشرة منشورة سارية على تاريخ نهاية الفترة.
         // إن لم توجد نشرة، نستخدم BaseCurrency + ExchangeRatesJson كسلوك توافقي (legacy).
@@ -151,9 +155,7 @@ public class GetAccountStatementHandler : IRequestHandler<GetAccountStatementQue
         var statusInts = allowedStatuses.Select(s => (int)s).ToArray();
         bool fxFallback = false;
 
-        // الحركات داخل الفترة: النوع Normal فقط — قيود Opening تُعامَل كرصيد افتتاحي ولا تظهر بين الحركات.
-        // ملاحظة: حسابات الأرباح/الخسائر (4،5) نقصر حركتها على السنة المالية المرجعية حتى لو
-        //         امتدّ مدى التقرير لسنوات سابقة، لأن قيود تلك السنوات تخصّ نتيجة سنة منفصلة.
+        // الحركات داخل الفترة — قيود Normal فقط (قيود Opening تدخل في الرصيد الافتتاحي فقط).
         var inPeriodSql = @"
 SELECT 
     l.Id            AS LineId,
@@ -180,11 +182,9 @@ INNER JOIN acc.Accounts a       ON a.Id = l.AccountId
 LEFT JOIN acc.JournalVoucherTypes vt ON vt.Id = e.VoucherTypeId
 WHERE l.IsDeleted = 0 AND e.IsDeleted = 0
   AND e.[Status] IN (" + string.Join(",", statusInts) + @")
-  AND e.EntryType = 1
+  AND " + ReportEntrySqlFragments.AccountStatementPeriodEntryFilter() + @"
   AND e.EntryDate >= @from AND e.EntryDate <= @to
-  AND (a.[Type] IN (1,2,3)
-       OR (a.[Type] IN (4,5)
-            AND (@plFyStart IS NULL OR e.EntryDate >= @plFyStart)))
+  AND " + ReportEntrySqlFragments.AccountStatementPeriodAccountFilter() + @"
   AND (@accountId IS NULL OR l.AccountId = @accountId)
   AND (@currency IS NULL OR e.Currency = @currency)
 ORDER BY e.EntryDate, e.Id, l.Id;";
@@ -200,11 +200,11 @@ ORDER BY e.EntryDate, e.Id, l.Id;";
         await using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = inPeriodSql;
+            _db.ConfigureDbCommand(cmd);
             AddParam(cmd, "@from", fromDate);
             AddParam(cmd, "@to", toDate);
             AddParam(cmd, "@accountId", (object?)req.AccountId ?? DBNull.Value);
             AddParam(cmd, "@currency", (object?)currency ?? DBNull.Value);
-            AddParam(cmd, "@plFyStart", (object?)plFyStart ?? DBNull.Value);
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
@@ -231,10 +231,7 @@ ORDER BY e.EntryDate, e.Id, l.Id;";
             }
         }
 
-        // الرصيد الافتتاحي:
-        //   • أصول/خصوم/حقوق ملكية: حركات Normal قبل @from + قيود Opening حتى @to.
-        //   • أرباح/خسائر: حركات Normal من بداية السنة المالية المرجعية حتى @from
-        //                  (لا تُحسب قيود Opening، ولا حركات السنوات السابقة).
+        // الرصيد الافتتاحي: حركات قبل @from (قيود Opening في يوم from تُعرض كصفوف منفصلة).
         decimal openingBalance = 0m;
         var openingSql = @"
 SELECT 
@@ -245,20 +242,14 @@ INNER JOIN acc.JournalEntries e ON e.Id = l.JournalEntryId
 INNER JOIN acc.Accounts a       ON a.Id = l.AccountId
 WHERE l.IsDeleted = 0 AND e.IsDeleted = 0
   AND e.[Status] IN (" + string.Join(",", statusInts) + @")
-  AND (
-        (a.[Type] IN (1,2,3) AND (
-            (e.EntryType = 1 AND e.EntryDate < @from)
-         OR (e.EntryType = 2 AND e.EntryDate <= @to)
-        ))
-     OR (a.[Type] IN (4,5) AND e.EntryType = 1 AND e.EntryDate < @from
-            AND (@plFyStart IS NULL OR e.EntryDate >= @plFyStart))
-      )
+  AND " + ReportEntrySqlFragments.AccountStatementOpeningBalanceWhere(req.IncludeOpeningEntries, includePriorOpening) + @"
   AND (@accountId IS NULL OR l.AccountId = @accountId)
   AND (@currency IS NULL OR e.Currency = @currency);";
 
         await using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = openingSql;
+            _db.ConfigureDbCommand(cmd);
             AddParam(cmd, "@from", fromDate);
             AddParam(cmd, "@to", toDate);
             AddParam(cmd, "@accountId", (object?)req.AccountId ?? DBNull.Value);
@@ -283,14 +274,7 @@ INNER JOIN acc.JournalEntries e ON e.Id = l.JournalEntryId
 INNER JOIN acc.Accounts a       ON a.Id = l.AccountId
 WHERE l.IsDeleted = 0 AND e.IsDeleted = 0
   AND e.[Status] IN (" + string.Join(",", statusInts) + @")
-  AND (
-        (a.[Type] IN (1,2,3) AND (
-            (e.EntryType = 1 AND e.EntryDate < @from)
-         OR (e.EntryType = 2 AND e.EntryDate <= @to)
-        ))
-     OR (a.[Type] IN (4,5) AND e.EntryType = 1 AND e.EntryDate < @from
-            AND (@plFyStart IS NULL OR e.EntryDate >= @plFyStart))
-      )
+  AND " + ReportEntrySqlFragments.AccountStatementOpeningBalanceWhere(req.IncludeOpeningEntries, includePriorOpening) + @"
   AND (@accountId IS NULL OR l.AccountId = @accountId)
   AND (@currency IS NULL OR e.Currency = @currency)
 GROUP BY e.Currency;";
@@ -298,6 +282,7 @@ GROUP BY e.Currency;";
         await using (var cmd2 = conn.CreateCommand())
         {
             cmd2.CommandText = openingByCcySql;
+            _db.ConfigureDbCommand(cmd2);
             AddParam(cmd2, "@from", fromDate);
             AddParam(cmd2, "@to", toDate);
             AddParam(cmd2, "@accountId", (object?)req.AccountId ?? DBNull.Value);
@@ -316,13 +301,11 @@ GROUP BY e.Currency;";
             }
         }
 
-        // ── تفاصيل قيود الافتتاح (EntryType=2) لعرضها في رأس الكشف.
-        // يجمع السطور المتعلقة بالحساب ضمن نفس قيد الافتتاح في صف واحد ليبقى
-        // الكشف مفهوماً، ويعرض المبالغ بعملة القيد + المقوَّم بالعملة الأساسية.
+        // ‎قيود الافتتاح/التدوير ضمن السنة الحالية فقط (لا تُجلب قيود سنوات سابقة).
         var openingEntries = new List<OpeningEntryRowDto>();
-        // قيود الافتتاح تخصّ أساساً الحسابات الميزانية (1،2،3). نُقصّر الاستعلام عليها
-        // ليتسق العرض مع احتساب الافتتاحي.
-        var openingEntriesSql = @"
+        if (req.IncludeOpeningEntries)
+        {
+            var openingEntriesSql = @"
 SELECT
     e.Id              AS EntryId,
     e.EntryNumber     AS EntryNumber,
@@ -336,39 +319,42 @@ INNER JOIN acc.JournalEntries e ON e.Id = l.JournalEntryId
 INNER JOIN acc.Accounts a       ON a.Id = l.AccountId
 WHERE l.IsDeleted = 0 AND e.IsDeleted = 0
   AND e.[Status] IN (" + string.Join(",", statusInts) + @")
-  AND e.EntryType = 2
-  AND e.EntryDate <= @to
-  AND a.[Type] IN (1,2,3)
+  AND " + ReportEntrySqlFragments.AccountStatementOpeningEntriesWhere() + @"
+  AND " + ReportEntrySqlFragments.AccountStatementPeriodAccountFilter() + @"
   AND (@accountId IS NULL OR l.AccountId = @accountId)
   AND (@currency IS NULL OR e.Currency = @currency)
 GROUP BY e.Id, e.EntryNumber, e.EntryDate, e.Currency, e.[Description]
 ORDER BY e.EntryDate, e.EntryNumber;";
-        await using (var cmd = conn.CreateCommand())
-        {
-            cmd.CommandText = openingEntriesSql;
-            AddParam(cmd, "@to", toDate);
-            AddParam(cmd, "@accountId", (object?)req.AccountId ?? DBNull.Value);
-            AddParam(cmd, "@currency", (object?)currency ?? DBNull.Value);
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
+            await using (var cmd = conn.CreateCommand())
             {
-                var ccy = reader["Currency"]?.ToString() ?? baseCur;
-                var debit = reader.GetDecimal(reader.GetOrdinal("Debit"));
-                var credit = reader.GetDecimal(reader.GetOrdinal("Credit"));
-                var net = debit - credit;
-                var mult = GetMultiplier(ccy, baseCur, rates, ref fxFallback);
-                openingEntries.Add(new OpeningEntryRowDto
+                cmd.CommandText = openingEntriesSql;
+                _db.ConfigureDbCommand(cmd);
+                AddParam(cmd, "@from", fromDate);
+                AddParam(cmd, "@to", toDate);
+                AddParam(cmd, "@plFyStart", (object?)plFyStart ?? DBNull.Value);
+                AddParam(cmd, "@accountId", (object?)req.AccountId ?? DBNull.Value);
+                AddParam(cmd, "@currency", (object?)currency ?? DBNull.Value);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
                 {
-                    EntryId = reader.GetInt32(reader.GetOrdinal("EntryId")),
-                    EntryNumber = reader["EntryNumber"]?.ToString() ?? "",
-                    EntryDate = reader.GetDateTime(reader.GetOrdinal("EntryDate")),
-                    Currency = ccy,
-                    Description = reader["EntryDescription"]?.ToString(),
-                    Debit = debit,
-                    Credit = credit,
-                    Net = net,
-                    NetValuated = net * mult,
-                });
+                    var ccy = reader["Currency"]?.ToString() ?? baseCur;
+                    var debit = reader.GetDecimal(reader.GetOrdinal("Debit"));
+                    var credit = reader.GetDecimal(reader.GetOrdinal("Credit"));
+                    var net = debit - credit;
+                    var mult = GetMultiplier(ccy, baseCur, rates, ref fxFallback);
+                    openingEntries.Add(new OpeningEntryRowDto
+                    {
+                        EntryId = reader.GetInt32(reader.GetOrdinal("EntryId")),
+                        EntryNumber = reader["EntryNumber"]?.ToString() ?? "",
+                        EntryDate = reader.GetDateTime(reader.GetOrdinal("EntryDate")),
+                        Currency = ccy,
+                        Description = reader["EntryDescription"]?.ToString(),
+                        Debit = debit,
+                        Credit = credit,
+                        Net = net,
+                        NetValuated = net * mult,
+                    });
+                }
             }
         }
 

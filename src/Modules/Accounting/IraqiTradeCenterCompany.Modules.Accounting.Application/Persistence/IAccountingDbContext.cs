@@ -21,6 +21,11 @@ public interface IAccountingDbContext
     DbSet<CashBoxCurrency> CashBoxCurrencies { get; }
     DbSet<CashBoxTransfer> CashBoxTransfers { get; }
     DbSet<VoucherAttachment> VoucherAttachments { get; }
+    DbSet<AttachmentSyncOutbox> AttachmentSyncOutbox { get; }
+    DbSet<FinancialPartyCategory> FinancialPartyCategories { get; }
+    DbSet<FinancialParty> FinancialParties { get; }
+    DbSet<AccountSettlement> AccountSettlements { get; }
+    DbSet<AccountSettlementSettings> AccountSettlementSettings { get; }
     Task<int> SaveChangesAsync(CancellationToken ct = default);
 
     /// <summary>
@@ -31,11 +36,12 @@ public interface IAccountingDbContext
     Task<long> GetNextJournalEntryNumberAsync(int fiscalYearId, CancellationToken ct = default);
 
     /// <summary>
-    /// الحصول على التسلسل التالي لرقم السند ضمن نوع سند محدد (يبدأ من 1 لكل نوع).
+    /// الحصول على التسلسل التالي لرقم السند ضمن نوع سند محدد وسنة مالية محددة
+    /// (يبدأ من 1 لكل نوع سند في كل سنة مالية على حدة — إعادة الترقيم سنوياً).
     /// يُستعمل لتوليد أرقام مثل PV-1, PV-2, RV-1 … بحسب رمز نوع السند في الواجهة.
     /// يجب استدعاؤها داخل معاملة لضمان الذرّية ومنع تكرار التسلسل.
     /// </summary>
-    Task<int> GetNextVoucherSequenceAsync(int voucherTypeId, CancellationToken ct = default);
+    Task<int> GetNextVoucherSequenceAsync(int voucherTypeId, int fiscalYearId, CancellationToken ct = default);
 
     /// <summary>
     /// بدء معاملة قاعدة بيانات صريحة (للأمر يحتاج ذرية عبر عدّة عمليات).
@@ -46,4 +52,19 @@ public interface IAccountingDbContext
     /// الحصول على اتصال DB الخام (لاستعلامات SQL مخصصة).
     /// </summary>
     System.Data.Common.DbConnection GetDbConnection();
+
+    /// <summary>
+    /// يربط أمر SQL يدوي بالمعاملة الجارية (إن وُجدت) — ضروري عند استخدام GetDbConnection داخل BeginTransaction.
+    /// </summary>
+    void ConfigureDbCommand(System.Data.Common.DbCommand command);
+
+    /// <summary>
+    /// يضمن وجود صف إعدادات التسوية (Id=1).
+    /// </summary>
+    Task EnsureAccountSettlementSettingsRowAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// يضبط IsExcludedFromReports لحسابات الوسيط المعرّفة في إعدادات التسوية.
+    /// </summary>
+    Task SyncAccountSettlementTransitExclusionsAsync(CancellationToken ct = default);
 }

@@ -22,6 +22,8 @@ public class JournalEntryConfig : IEntityTypeConfiguration<JournalEntry>
         b.Property(x => x.ReferenceNumber).HasMaxLength(100);
         b.Property(x => x.PostedBy).HasMaxLength(100);
         b.Property(x => x.ManualNumber).HasMaxLength(50);
+        b.Property(x => x.ManualExchangeRate).HasColumnType("decimal(18,6)");
+        b.Property(x => x.ManualExchangeRateOperation).HasColumnType("int");
         b.HasIndex(x => new { x.FiscalYearId, x.EntryNumber }).IsUnique();
         b.HasIndex(x => x.EntryDate);
         b.HasIndex(x => x.Status);

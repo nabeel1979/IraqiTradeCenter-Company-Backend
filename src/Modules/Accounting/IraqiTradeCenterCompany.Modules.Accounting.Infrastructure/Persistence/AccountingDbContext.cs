@@ -1,8 +1,10 @@
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
+using System.Text.Json;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Entities;
 using IraqiTradeCenterCompany.SharedKernel.Common;
 using IraqiTradeCenterCompany.SharedKernel.Interfaces;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace IraqiTradeCenterCompany.Modules.Accounting.Infrastructure.Persistence;
 
@@ -32,6 +34,11 @@ public class AccountingDbContext : DbContext, IAccountingDbContext
     public DbSet<CashBoxCurrency> CashBoxCurrencies => Set<CashBoxCurrency>();
     public DbSet<CashBoxTransfer> CashBoxTransfers => Set<CashBoxTransfer>();
     public DbSet<VoucherAttachment> VoucherAttachments => Set<VoucherAttachment>();
+    public DbSet<AttachmentSyncOutbox> AttachmentSyncOutbox => Set<AttachmentSyncOutbox>();
+    public DbSet<FinancialPartyCategory> FinancialPartyCategories => Set<FinancialPartyCategory>();
+    public DbSet<FinancialParty> FinancialParties => Set<FinancialParty>();
+    public DbSet<AccountSettlement> AccountSettlements => Set<AccountSettlement>();
+    public DbSet<AccountSettlementSettings> AccountSettlementSettings => Set<AccountSettlementSettings>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -94,10 +101,12 @@ WHERE FiscalYearId = {0}
             .FirstAsync(ct);
     }
 
-    public async Task<int> GetNextVoucherSequenceAsync(int voucherTypeId, CancellationToken ct = default)
+    public async Task<int> GetNextVoucherSequenceAsync(int voucherTypeId, int fiscalYearId, CancellationToken ct = default)
     {
-        // ترقيم مستقل لكل نوع سند: PV-1, PV-2 … RV-1 … (يبدأ من 1 لكل نوع).
-        // نفس نمط GetNextJournalEntryNumberAsync لكن المورد مفصول حسب VoucherTypeId.
+        // ترقيم مستقل لكل نوع سند داخل كل سنة مالية: PV-1, PV-2 … (يبدأ من 1
+        // لكل نوع سند في كل سنة مالية على حدة — إعادة الترقيم سنوياً).
+        // نفس نمط GetNextJournalEntryNumberAsync لكن المورد مفصول حسب
+        // (VoucherTypeId + FiscalYearId) لمنع تكرار الرقم عند الطلبات المتزامنة.
         if (Database.CurrentTransaction == null)
         {
             throw new InvalidOperationException(
@@ -114,19 +123,20 @@ EXEC @res = sp_getapplock
 IF @res < 0
     THROW 51000, N'تعذّر الحصول على قفل توليد رقم السند، حاول مرة أخرى', 1;";
         var resourceParam = new Microsoft.Data.SqlClient.SqlParameter("@resource",
-            $"acc.VoucherSequence.VT:{voucherTypeId}");
+            $"acc.VoucherSequence.VT:{voucherTypeId}.FY:{fiscalYearId}");
         await Database.ExecuteSqlRawAsync(lockSql, new[] { resourceParam }, ct);
 
-        // نقرأ MAX من كل القيود (نشطة + محذوفة) لنفس نوع السند، مع +1.
+        // نقرأ MAX من كل القيود (نشطة + محذوفة) لنفس نوع السند ونفس السنة المالية، مع +1.
         // إدراج المحذوفة يحفظ تسلسل التدقيق ويمنع إعادة استخدام نفس رقم سند.
         const string maxSql = @"
 SELECT ISNULL(MAX(VoucherSequence), 0) + 1 AS Value
 FROM acc.JournalEntries
 WHERE VoucherTypeId = {0}
+  AND FiscalYearId = {1}
   AND VoucherSequence IS NOT NULL";
 
         return await Database
-            .SqlQueryRaw<int>(maxSql, voucherTypeId)
+            .SqlQueryRaw<int>(maxSql, voucherTypeId, fiscalYearId)
             .FirstAsync(ct);
     }
 
@@ -135,4 +145,56 @@ WHERE VoucherTypeId = {0}
         => Database.BeginTransactionAsync(ct);
 
     public System.Data.Common.DbConnection GetDbConnection() => Database.GetDbConnection();
+
+    public void ConfigureDbCommand(System.Data.Common.DbCommand command)
+    {
+        var tx = Database.CurrentTransaction?.GetDbTransaction();
+        if (tx != null)
+            command.Transaction = tx;
+    }
+
+    public async Task EnsureAccountSettlementSettingsRowAsync(CancellationToken ct = default)
+    {
+        var exists = await AccountSettlementSettings
+            .AsNoTracking()
+            .AnyAsync(x => x.Id == Domain.Entities.AccountSettlementSettings.SingletonId, ct);
+        if (exists) return;
+
+        await Database.ExecuteSqlRawAsync(@"
+SET IDENTITY_INSERT acc.AccountSettlementSettings ON;
+INSERT INTO acc.AccountSettlementSettings (Id, CreatedAt, IsDeleted)
+VALUES (1, GETUTCDATE(), 0);
+SET IDENTITY_INSERT acc.AccountSettlementSettings OFF;
+", ct);
+    }
+
+    public async Task SyncAccountSettlementTransitExclusionsAsync(CancellationToken ct = default)
+    {
+        var settings = await AccountSettlementSettings.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == Domain.Entities.AccountSettlementSettings.SingletonId, ct);
+        if (settings?.TransitAccountsJson is not { Length: > 0 } json)
+            return;
+
+        List<int> transitIds;
+        try
+        {
+            var parsed = JsonSerializer.Deserialize<Dictionary<string, int>>(json);
+            transitIds = parsed?.Values.Where(id => id > 0).Distinct().ToList() ?? [];
+        }
+        catch
+        {
+            return;
+        }
+
+        if (transitIds.Count == 0) return;
+
+        var accounts = await Accounts
+            .Where(a => transitIds.Contains(a.Id) && !a.IsExcludedFromReports)
+            .ToListAsync(ct);
+        if (accounts.Count == 0) return;
+
+        foreach (var acc in accounts)
+            acc.SetExcludedFromReports(true);
+        await SaveChangesAsync(ct);
+    }
 }

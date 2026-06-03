@@ -38,6 +38,7 @@ public class VoucherAttachmentsController : BaseApiController
     private readonly IAuditLogger _audit;
     private readonly ICurrentUserService _currentUser;
     private readonly IPermissionService _perms;
+    private readonly VoucherAttachmentDeletionService _attachmentDeletion;
 
     public VoucherAttachmentsController(
         IAccountingDbContext db,
@@ -45,7 +46,8 @@ public class VoucherAttachmentsController : BaseApiController
         IAttachmentSettingsService attachmentSettings,
         IAuditLogger audit,
         ICurrentUserService currentUser,
-        IPermissionService perms)
+        IPermissionService perms,
+        VoucherAttachmentDeletionService attachmentDeletion)
     {
         _db = db;
         _storageRegistry = storageRegistry;
@@ -53,6 +55,7 @@ public class VoucherAttachmentsController : BaseApiController
         _audit = audit;
         _currentUser = currentUser;
         _perms = perms;
+        _attachmentDeletion = attachmentDeletion;
     }
 
     public class AttachmentDto
@@ -64,6 +67,8 @@ public class VoucherAttachmentsController : BaseApiController
         public string? ContentType { get; set; }
         public long SizeBytes { get; set; }
         public string StorageProvider { get; set; } = default!;
+        public bool IsOnLocal { get; set; }
+        public bool IsOnR2 { get; set; }
         public Guid? UploadedByUserId { get; set; }
         public string? UploadedByUserName { get; set; }
         public DateTime UploadedAtUtc { get; set; }
@@ -92,6 +97,8 @@ public class VoucherAttachmentsController : BaseApiController
                 ContentType = a.ContentType,
                 SizeBytes = a.SizeBytes,
                 StorageProvider = a.StorageProvider,
+                IsOnLocal = a.IsOnLocal,
+                IsOnR2 = a.IsOnR2,
                 UploadedByUserId = a.UploadedByUserId,
                 UploadedByUserName = a.UploadedByUserName,
                 UploadedAtUtc = a.UploadedAtUtc,
@@ -114,29 +121,40 @@ public class VoucherAttachmentsController : BaseApiController
         if (file == null || file.Length == 0)
             return BadRequest(new { success = false, message = "لم يُرفع أي ملف" });
 
+        if (!AttachmentAllowedTypes.IsAllowed(file, out var typeError))
+            return BadRequest(new { success = false, message = typeError });
+
         var settingsRow = await _attachmentSettings.GetAsync(ct);
         var maxBytes = settingsRow.MaxFileSizeBytes > 0 ? settingsRow.MaxFileSizeBytes : 25L * 1024 * 1024;
         if (file.Length > maxBytes)
             return BadRequest(new { success = false, message = $"حجم الملف يتجاوز الحد الأعلى ({maxBytes / (1024 * 1024)} ميجابايت)" });
 
-        var entry = await _db.JournalEntries.FirstOrDefaultAsync(e => e.Id == entryId, ct);
+        var entry = await _db.JournalEntries
+            .Include(e => e.VoucherType)
+            .FirstOrDefaultAsync(e => e.Id == entryId, ct);
         if (entry == null) return NotFound(new { success = false, message = "القيد غير موجود" });
 
         if (!await CanModifyAsync(entry, ct))
             return Forbid();
 
-        var storage = await _storageRegistry.CurrentAsync(ct);
+        var fiscalYearName = await _db.FiscalYears.AsNoTracking()
+            .Where(f => f.Id == entry.FiscalYearId)
+            .Select(f => f.Name)
+            .FirstOrDefaultAsync(ct) ?? "unknown";
 
-        // ‎احفظ على المخزن مع حساب SHA-256 خفّة لكشف التكرار لاحقاً.
+        var logicalFolder = AttachmentStoragePathHelper.BuildLogicalFolder(fiscalYearName, entry);
+
+        // ‎مخطط التخزين الجديد: نحفظ دائماً محلياً أولاً (سرعة + موثوقية فورية)،
+        // ‎ثم نُسجّل عملية رفع في الـ outbox ليأخذها سيرفس المزامنة كل دقيقة لـ R2.
+        // ‎بعد 24 ساعة من نجاح الرفع لـ R2 تُمسح النسخة المحلّية تلقائياً.
+        var localStorage = _storageRegistry.GetByName("Local");
+
         string sha256;
         long size;
         string storageKey;
         var tempPath = Path.GetTempFileName();
         try
         {
-            // ‎نُمرّر النسخة على القرص المؤقت إلى المخزن النهائي حتى لا يحتاج
-            // ‎المخزن إلى buffering كامل في الذاكرة. ASP.NET قد يكون قد قرأ
-            // ‎الـ stream إلى ملف مؤقّت بالفعل لو تجاوز buffer الذاكرة.
             await using (var temp = System.IO.File.Create(tempPath))
             {
                 await file.CopyToAsync(temp, ct);
@@ -150,8 +168,8 @@ public class VoucherAttachmentsController : BaseApiController
             }
             await using (var fs = System.IO.File.OpenRead(tempPath))
             {
-                storageKey = await storage.SaveAsync(
-                    logicalFolder: $"vouchers/{entryId}",
+                storageKey = await localStorage.SaveAsync(
+                    logicalFolder: logicalFolder,
                     suggestedFileName: file.FileName,
                     content: fs,
                     contentType: file.ContentType,
@@ -167,7 +185,9 @@ public class VoucherAttachmentsController : BaseApiController
             journalEntryId: entryId,
             displayName: string.IsNullOrWhiteSpace(displayName) ? file.FileName : displayName!,
             originalFileName: file.FileName,
-            storageProvider: storage.ProviderName,
+            // ‎نُسجّل المزوّد كـ "Local" حتى تُحوَّل القراءة لاحقاً تلقائياً من R2 لو
+            // ‎النسخة المحلّية اختفت (حسب IsOnLocal/IsOnR2 في القارئ).
+            storageProvider: "Local",
             storageKey: storageKey,
             sizeBytes: size,
             contentType: file.ContentType,
@@ -178,6 +198,23 @@ public class VoucherAttachmentsController : BaseApiController
 
         _db.VoucherAttachments.Add(attachment);
         await _db.SaveChangesAsync(ct);
+
+        // ‎سجّل عملية الرفع في طابور المزامنة فقط لو الـ R2 مهيأ (وإلا يكفي
+        // ‎التخزين المحلي بلا مزامنة). نلتقط الإعدادات بدون قراءة كلمة السر —
+        // ‎يكفي أن تكون كل المفاتيح موجودة لتفعيل المزامنة.
+        var r2Configured = !string.IsNullOrWhiteSpace(settingsRow.R2AccountId)
+            && !string.IsNullOrWhiteSpace(settingsRow.R2AccessKeyId)
+            && !string.IsNullOrWhiteSpace(settingsRow.R2SecretAccessKey)
+            && !string.IsNullOrWhiteSpace(settingsRow.R2Bucket);
+        if (r2Configured)
+        {
+            _db.AttachmentSyncOutbox.Add(AttachmentSyncOutbox.CreateUpload(
+                attachmentId: attachment.Id,
+                storageKey: storageKey,
+                contentType: file.ContentType,
+                sizeBytes: size));
+            await _db.SaveChangesAsync(ct);
+        }
 
         await _audit.LogAsync(
             entityType: "VoucherAttachment",
@@ -216,6 +253,8 @@ public class VoucherAttachmentsController : BaseApiController
                 ContentType = attachment.ContentType,
                 SizeBytes = attachment.SizeBytes,
                 StorageProvider = attachment.StorageProvider,
+                IsOnLocal = attachment.IsOnLocal,
+                IsOnR2 = attachment.IsOnR2,
                 UploadedByUserId = attachment.UploadedByUserId,
                 UploadedByUserName = attachment.UploadedByUserName,
                 UploadedAtUtc = attachment.UploadedAtUtc,
@@ -245,9 +284,44 @@ public class VoucherAttachmentsController : BaseApiController
             details: new { voucherId = entryId, fileName = att.OriginalFileName },
             ct: ct);
 
-        // ‎اقرأ من نفس المخزن الذي حُفظ به سابقاً (قد يختلف عن الإعداد الحالي).
-        var readStorage = _storageRegistry.GetByName(att.StorageProvider);
-        var stream = await readStorage.OpenReadAsync(att.StorageKey, ct);
+        // ‎ترتيب القراءة (دائماً عبر الـ API — لا Redirect إلى r2.dev):
+        // ‎  1) النسخة المحلّية إن وُجدت (أسرع).
+        // ‎  2) R2 عبر S3 API (مع توكين الخادم).
+        // ‎  3) Fallback: محلي فشل ⇒ جرّب R2.
+        // ‎لا نُعيد التوجيه إلى R2PublicBaseUrl لأن axios/المتصفح يتبع
+        // ‎302 cross-origin فيفشل بـ CORS أو 401 عندما الوصول العام غير مفعّل.
+        Stream stream;
+        try
+        {
+            if (att.IsOnLocal)
+            {
+                var local = _storageRegistry.GetByName("Local");
+                stream = await local.OpenReadAsync(att.StorageKey, ct);
+            }
+            else if (att.IsOnR2)
+            {
+                var r2 = _storageRegistry.GetByName("R2");
+                stream = await r2.OpenReadAsync(att.StorageKey, ct);
+            }
+            else
+            {
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    success = false,
+                    message = "الملف قيد المزامنة، حاول بعد قليل."
+                });
+            }
+        }
+        catch (FileNotFoundException)
+        {
+            if (att.IsOnR2)
+            {
+                var r2 = _storageRegistry.GetByName("R2");
+                stream = await r2.OpenReadAsync(att.StorageKey, ct);
+            }
+            else throw;
+        }
+
         var contentType = string.IsNullOrWhiteSpace(att.ContentType) ? "application/octet-stream" : att.ContentType!;
         return File(stream, contentType, fileDownloadName: att.OriginalFileName, enableRangeProcessing: true);
     }
@@ -302,6 +376,8 @@ public class VoucherAttachmentsController : BaseApiController
                 ContentType = att.ContentType,
                 SizeBytes = att.SizeBytes,
                 StorageProvider = att.StorageProvider,
+                IsOnLocal = att.IsOnLocal,
+                IsOnR2 = att.IsOnR2,
                 UploadedByUserId = att.UploadedByUserId,
                 UploadedByUserName = att.UploadedByUserName,
                 UploadedAtUtc = att.UploadedAtUtc,
@@ -348,6 +424,8 @@ public class VoucherAttachmentsController : BaseApiController
                 ContentType = att.ContentType,
                 SizeBytes = att.SizeBytes,
                 StorageProvider = att.StorageProvider,
+                IsOnLocal = att.IsOnLocal,
+                IsOnR2 = att.IsOnR2,
                 UploadedByUserId = att.UploadedByUserId,
                 UploadedByUserName = att.UploadedByUserName,
                 UploadedAtUtc = att.UploadedAtUtc,
@@ -367,17 +445,7 @@ public class VoucherAttachmentsController : BaseApiController
             .FirstOrDefaultAsync(a => a.Id == attId && a.JournalEntryId == entryId, ct);
         if (att == null) return NotFound(new { success = false, message = "المرفق غير موجود" });
 
-        // ‎احذف الملف من المخزن أولاً ثم الصفّ — لو فشل الحذف من المخزن نكتفي بـ
-        // ‎soft-delete على الـ DB حتى لا نعمي السجل أن المستخدم حاول الحذف.
-        try
-        {
-            var delStorage = _storageRegistry.GetByName(att.StorageProvider);
-            await delStorage.DeleteAsync(att.StorageKey, ct);
-        }
-        catch { /* تُسجَّل لكن لا تُفشل العملية */ }
-
-        att.MarkAsDeleted();
-        await _db.SaveChangesAsync(ct);
+        await _attachmentDeletion.PurgeSingleAsync(att, ct);
 
         await _audit.LogAsync(
             entityType: "VoucherAttachment",

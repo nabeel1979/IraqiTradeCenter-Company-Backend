@@ -39,7 +39,9 @@ public class PostJournalEntryHandler : IRequestHandler<PostJournalEntryCommand, 
             if (nonLeaf != null) return Result.Failure<int>($"الحساب '{nonLeaf.NameAr}' حساب رئيسي - لا يقبل قيوداً");
 
             // التحقق من وجود نشرة أسعار منشورة سارية إذا كانت العملة أجنبية
-            var currencyCheck = await EnsureCurrencyHasActiveBulletin(request.Currency, request.EntryDate, ct);
+            // (يُسمح بالحفظ إن أدخل المستخدم سعر صرف يدوياً عند غياب النشرة).
+            var currencyCheck = await CurrencyBulletinGuard.CheckAsync(
+                _db, request.Currency, request.EntryDate, request.ManualExchangeRate, ct);
             if (currencyCheck != null) return Result.Failure<int>(currencyCheck);
 
             // ‎فحص قواعد الصناديق: منع استخدام حسابات الصناديق في قيد عام،
@@ -52,6 +54,11 @@ public class PostJournalEntryHandler : IRequestHandler<PostJournalEntryCommand, 
                 excludeJournalEntryId: null,
                 ct);
             if (cashBoxCheck != null) return Result.Failure<int>(cashBoxCheck);
+
+            // ‎فحص صلاحية العملة للأطراف المالية: الحساب المقابل يجب أن يدعم عملة السند.
+            var partyCheck = await FinancialPartyGuard.ValidateAsync(
+                _db, accountIds, request.Currency, ct);
+            if (partyCheck != null) return Result.Failure<int>(partyCheck);
 
             // معاملة صريحة لضمان: GetNextNumber + INSERT ذرّيان → يمنع تكرار رقم القيد
             // عند طلبات متزامنة. القفل sp_getapplock داخل GetNextJournalEntryNumberAsync
@@ -74,7 +81,7 @@ public class PostJournalEntryHandler : IRequestHandler<PostJournalEntryCommand, 
             int? voucherSeq = null;
             if (request.VoucherTypeId.HasValue)
             {
-                voucherSeq = await _db.GetNextVoucherSequenceAsync(request.VoucherTypeId.Value, ct);
+                voucherSeq = await _db.GetNextVoucherSequenceAsync(request.VoucherTypeId.Value, fyId, ct);
             }
 
             var entry = JournalEntry.Create(request.EntryDate, fyId, periodId,
@@ -82,7 +89,9 @@ public class PostJournalEntryHandler : IRequestHandler<PostJournalEntryCommand, 
                 type: request.EntryType, currency: request.Currency,
                 entryNumber: entryNumber, voucherTypeId: request.VoucherTypeId,
                 voucherSequence: voucherSeq,
-                manualNumber: request.ManualNumber);
+                manualNumber: request.ManualNumber,
+                manualExchangeRate: request.ManualExchangeRate,
+                manualExchangeRateOperation: request.ManualExchangeRateOperation);
 
             foreach (var l in request.Lines)
             {
@@ -134,41 +143,5 @@ public class PostJournalEntryHandler : IRequestHandler<PostJournalEntryCommand, 
         catch (UnbalancedJournalEntryException ex) { return Result.Failure<int>(ex.Message); }
         catch (ClosedPeriodException ex) { return Result.Failure<int>(ex.Message); }
         catch (DomainException ex) { return Result.Failure<int>(ex.Message); }
-    }
-
-    /// <summary>
-    /// إذا كانت العملة غير العملة الرئيسية للنشرة المنشورة الأحدث، يجب أن يكون هناك سطر سعر صرف لها.
-    /// إن لم توجد نشرة منشورة سارية أصلاً، يُرفض القيد بعملة غير IQD (الافتراضية للنظام).
-    /// </summary>
-    private async Task<string?> EnsureCurrencyHasActiveBulletin(string currency, DateTime entryDate, CancellationToken ct)
-    {
-        var cur = (currency ?? "IQD").Trim().ToUpperInvariant();
-        // نقطة سريانٍ: نهاية يوم القيد (لإتاحة استعمال نشرات اليوم)
-        var atUtc = (entryDate.Kind == DateTimeKind.Utc ? entryDate : entryDate.ToUniversalTime())
-            .Date.AddDays(1).AddTicks(-1);
-
-        var bulletin = await _db.CurrencyRateBulletins
-            .Include(b => b.Lines)
-            .Where(b => b.Status == CurrencyRateBulletinStatus.Published && b.EffectiveAt <= atUtc)
-            .OrderByDescending(b => b.EffectiveAt).ThenByDescending(b => b.Id)
-            .FirstOrDefaultAsync(ct);
-
-        // إذا العملة هي العملة الرئيسية للنشرة، لا حاجة لسطر صرف
-        if (bulletin != null && string.Equals(bulletin.BaseCurrency, cur, StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        // إذا لم توجد نشرة منشورة، اقبل فقط العملة الافتراضية IQD
-        if (bulletin == null)
-        {
-            if (cur == "IQD") return null;
-            return $"العملة {cur} غير مُسعَّرة في نشرة الأسعار — لا توجد نشرة منشورة سارية بتاريخ {entryDate:yyyy-MM-dd}. أصدِر نشرة أسعار وانشرها قبل حفظ القيد.";
-        }
-
-        // النشرة موجودة لكن العملة غير الرئيسية → يجب أن تحوي سطراً لها
-        var hasLine = bulletin.Lines.Any(l => string.Equals(l.Currency, cur, StringComparison.OrdinalIgnoreCase));
-        if (!hasLine)
-            return $"العملة {cur} غير مُسعَّرة في نشرة الأسعار '{bulletin.Name}'. أضف سعر صرف لها في النشرة أو أصدر نشرة جديدة تتضمنها قبل حفظ القيد.";
-
-        return null;
     }
 }

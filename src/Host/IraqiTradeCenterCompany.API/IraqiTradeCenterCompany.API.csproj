@@ -4,6 +4,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>IraqiTradeCenterCompany.API</RootNamespace>
+    <!-- يمنع ضمّ مخرجات النشر (publish/publish-out) ضمن العناصر الافتراضية (Web SDK
+         يضمّ **/*.json كمحتوى)، وإلا يحدث نسخ ذاتي متكرر يكسر البناء (MSB3030). -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);publish-out\**;publish\**</DefaultItemExcludes>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.2" />
@@ -13,6 +16,7 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
+    <PackageReference Include="AWSSDK.S3" Version="3.7.405.18" />
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.1" />
     <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
     <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />

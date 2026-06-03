@@ -17,6 +17,8 @@ public class AccountConfig : IEntityTypeConfiguration<Account>
         b.Property(x => x.Type).HasConversion<int>();
         b.Property(x => x.Nature).HasConversion<int>();
         b.Property(x => x.OpeningBalance).HasColumnType("decimal(18,3)");
+        b.Property(x => x.IsLockedForParties).HasDefaultValue(false).IsRequired();
+        b.Property(x => x.IsExcludedFromReports).HasDefaultValue(false).IsRequired();
         b.HasIndex(x => x.Code).IsUnique();
         b.HasIndex(x => x.ParentId);
         b.HasOne(x => x.Parent).WithMany(p => p.Children).HasForeignKey(x => x.ParentId)

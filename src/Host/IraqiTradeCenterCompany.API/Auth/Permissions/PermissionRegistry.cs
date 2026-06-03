@@ -41,6 +41,7 @@ public static class PermissionRegistry
         public const string Generate = "Generate"; // توليد شفرة ترخيص
         public const string Topup    = "Topup";    // شحن المحفظة
         public const string ViewAll  = "ViewAll";  // تجاوز فلترة الصناديق المسموحة (يرى كل الصناديق/السندات)
+        public const string Run      = "Run";      // تشغيل أرشفة / نسخ احتياطي
     }
 
     public static readonly Dictionary<string, string> ActionLabelsAr = new()
@@ -60,14 +61,16 @@ public static class PermissionRegistry
         [Actions.Generate] = "توليد",
         [Actions.Topup]    = "شحن",
         [Actions.ViewAll]  = "عرض جميع",
+        [Actions.Run]      = "تشغيل",
     };
 
     public static readonly Dictionary<string, string> ModuleLabelsAr = new()
     {
-        [Modules.Accounting] = "المحاسبة",
-        [Modules.Sales]      = "المبيعات",
-        [Modules.Inventory]  = "المخزون",
-        [Modules.System]     = "النظام",
+        [Modules.Accounting]          = "المحاسبة",
+        [Modules.Sales]               = "المبيعات",
+        [Modules.Inventory]           = "المخزون",
+        [Modules.System]              = "النظام",
+        [FinancialManagement.Module]  = "الإدارة المالية",
     };
 
     // ────────────────────────────────────────────────────────────
@@ -174,6 +177,35 @@ public static class PermissionRegistry
         }
     }
 
+    public static class FinancialManagement
+    {
+        public const string Module = "FinancialManagement";
+
+        public static class Categories
+        {
+            public const string Read   = "FinancialManagement.Categories.Read";
+            public const string Create = "FinancialManagement.Categories.Create";
+            public const string Update = "FinancialManagement.Categories.Update";
+            public const string Delete = "FinancialManagement.Categories.Delete";
+        }
+
+        public static class Parties
+        {
+            public const string Read   = "FinancialManagement.Parties.Read";
+            public const string Create = "FinancialManagement.Parties.Create";
+            public const string Update = "FinancialManagement.Parties.Update";
+            public const string Delete = "FinancialManagement.Parties.Delete";
+        }
+
+        public static class AccountSettlements
+        {
+            public const string Read   = "FinancialManagement.AccountSettlements.Read";
+            public const string Create = "FinancialManagement.AccountSettlements.Create";
+            public const string Update = "FinancialManagement.AccountSettlements.Update";
+            public const string Cancel = "FinancialManagement.AccountSettlements.Cancel";
+        }
+    }
+
     public static class Sales
     {
         public static class Invoices
@@ -273,6 +305,13 @@ public static class PermissionRegistry
             public const string Read  = "System.Audit.Read";
             public const string Export = "System.Audit.Export";
         }
+        /// <summary>أرشيف الميديا والنسخ الاحتياطي — مسار المستخدم + تشغيل الأرشفة.</summary>
+        public static class MediaBackup
+        {
+            public const string Read   = "System.MediaBackup.Read";
+            public const string Update = "System.MediaBackup.Update";
+            public const string Run    = "System.MediaBackup.Run";
+        }
     }
 
     // ────────────────────────────────────────────────────────────
@@ -318,6 +357,16 @@ public static class PermissionRegistry
 
         foreach (var p in Resource(Modules.Accounting, "VoucherTypes", "أنواع السندات", order: 19,
             Actions.Read, Actions.Create, Actions.Update, Actions.Delete)) yield return p;
+
+        // الإدارة المالية
+        foreach (var p in Resource(FinancialManagement.Module, "Categories", "أنواع الأطراف المالية", order: 20,
+            Actions.Read, Actions.Create, Actions.Update, Actions.Delete)) yield return p;
+
+        foreach (var p in Resource(FinancialManagement.Module, "Parties", "الأطراف المالية", order: 201,
+            Actions.Read, Actions.Create, Actions.Update, Actions.Delete)) yield return p;
+
+        foreach (var p in Resource(FinancialManagement.Module, "AccountSettlements", "تسوية الحسابات", order: 25,
+            Actions.Read, Actions.Create, Actions.Update, Actions.Cancel)) yield return p;
 
         // المبيعات
         foreach (var p in Resource(Modules.Sales, "Invoices", "الفواتير", order: 21,
@@ -366,6 +415,9 @@ public static class PermissionRegistry
         // ‎القراءة فقط (مع تصدير)؛ لا يوجد تعديل/حذف لأن السجل append-only.
         foreach (var p in Resource(Modules.System, "Audit", "سجل المراقبة", order: 47,
             Actions.Read, Actions.Export)) yield return p;
+
+        foreach (var p in Resource(Modules.System, "MediaBackup", "أرشيف الميديا والنسخ الاحتياطي", order: 48,
+            Actions.Read, Actions.Update, Actions.Run)) yield return p;
     }
 
     private static IEnumerable<Permission> Resource(string module, string resource, string nameAr, int order, params string[] actions)

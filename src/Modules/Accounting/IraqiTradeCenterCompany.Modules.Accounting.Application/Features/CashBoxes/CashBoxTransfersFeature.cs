@@ -133,11 +133,7 @@ public class GetCashBoxBalancesHandler : IRequestHandler<GetCashBoxBalancesQuery
 
     public async Task<List<CashBoxBalanceDto>> Handle(GetCashBoxBalancesQuery req, CancellationToken ct)
     {
-        var boxes = await _db.CashBoxes.AsNoTracking()
-            .Include(b => b.Account)
-            .Include(b => b.Currencies)
-            .OrderBy(b => b.DisplayOrder).ThenBy(b => b.Code)
-            .ToListAsync(ct);
+        var boxes = await CashBoxPartySource.GetAllAsync(_db, activeOnly: null, ct);
 
         var accountIds = boxes.Select(b => b.AccountId).Distinct().ToList();
         if (accountIds.Count == 0) return new List<CashBoxBalanceDto>();
@@ -195,8 +191,8 @@ public class GetCashBoxBalancesHandler : IRequestHandler<GetCashBoxBalancesQuery
                     box.Code,
                     box.NameAr,
                     box.AccountId,
-                    box.Account?.Code,
-                    box.Account?.NameAr,
+                    box.Code,
+                    box.NameAr,
                     cur.ToUpperInvariant(),
                     d,
                     c,
@@ -229,8 +225,6 @@ public class GetCashBoxTransfersHandler : IRequestHandler<GetCashBoxTransfersQue
     public async Task<List<CashBoxTransferDto>> Handle(GetCashBoxTransfersQuery req, CancellationToken ct)
     {
         var q = _db.CashBoxTransfers.AsNoTracking()
-            .Include(t => t.FromCashBox)
-            .Include(t => t.ToCashBox)
             .Include(t => t.TransitAccount)
             .Include(t => t.SendJournalEntry)
             .Include(t => t.ReceiveJournalEntry)
@@ -272,15 +266,22 @@ public class GetCashBoxTransfersHandler : IRequestHandler<GetCashBoxTransfersQue
             .Skip(skip).Take(take)
             .ToListAsync(ct);
 
-        return rows.Select(t => new CashBoxTransferDto(
+        var boxIds = rows.SelectMany(t => new[] { t.FromCashBoxId, t.ToCashBoxId }).Distinct();
+        var boxMap = await CashBoxPartySource.GetByIdsAsync(_db, boxIds, ct);
+
+        return rows.Select(t =>
+        {
+            boxMap.TryGetValue(t.FromCashBoxId, out var fromBox);
+            boxMap.TryGetValue(t.ToCashBoxId, out var toBox);
+            return new CashBoxTransferDto(
             t.Id,
             t.TransferNumber,
             t.FromCashBoxId,
-            t.FromCashBox?.Code ?? "—",
-            t.FromCashBox?.NameAr ?? "—",
+            fromBox?.Code ?? "—",
+            fromBox?.NameAr ?? "—",
             t.ToCashBoxId,
-            t.ToCashBox?.Code ?? "—",
-            t.ToCashBox?.NameAr ?? "—",
+            toBox?.Code ?? "—",
+            toBox?.NameAr ?? "—",
             t.TransitAccountId,
             t.TransitAccount?.Code,
             t.TransitAccount?.NameAr,
@@ -304,7 +305,8 @@ public class GetCashBoxTransfersHandler : IRequestHandler<GetCashBoxTransfersQue
             t.CancelledAt,
             t.CancellationReason,
             t.CreatedAt
-        )).ToList();
+        );
+        }).ToList();
     }
 }
 
@@ -348,27 +350,17 @@ public class CreateCashBoxTransferHandler : IRequestHandler<CreateCashBoxTransfe
 
             var cur = string.IsNullOrWhiteSpace(d.Currency) ? "IQD" : d.Currency.Trim().ToUpperInvariant();
 
-            var fromBox = await _db.CashBoxes.AsNoTracking()
-                .Include(b => b.Account)
-                .Include(b => b.Currencies)
-                .FirstOrDefaultAsync(b => b.Id == d.FromCashBoxId, ct);
+            var fromBox = await CashBoxPartySource.GetByIdAsync(_db, d.FromCashBoxId, ct);
             if (fromBox == null) return Result.Failure<int>("الصندوق المُرسِل غير موجود.");
             if (!fromBox.IsActive) return Result.Failure<int>($"الصندوق المُرسِل '{fromBox.NameAr}' معطّل.");
 
-            var toBox = await _db.CashBoxes.AsNoTracking()
-                .Include(b => b.Account)
-                .Include(b => b.Currencies)
-                .FirstOrDefaultAsync(b => b.Id == d.ToCashBoxId, ct);
+            var toBox = await CashBoxPartySource.GetByIdAsync(_db, d.ToCashBoxId, ct);
             if (toBox == null) return Result.Failure<int>("الصندوق المستلم غير موجود.");
             if (!toBox.IsActive) return Result.Failure<int>($"الصندوق المستلم '{toBox.NameAr}' معطّل.");
 
-            var fromSupports = fromBox.Currencies.Any(c => c.IsActive
-                && string.Equals(c.Currency, cur, StringComparison.OrdinalIgnoreCase));
-            if (!fromSupports)
+            if (!CashBoxPartySource.SupportsCurrency(fromBox, cur))
                 return Result.Failure<int>($"الصندوق '{fromBox.NameAr}' لا يدعم العملة {cur}.");
-            var toSupports = toBox.Currencies.Any(c => c.IsActive
-                && string.Equals(c.Currency, cur, StringComparison.OrdinalIgnoreCase));
-            if (!toSupports)
+            if (!CashBoxPartySource.SupportsCurrency(toBox, cur))
                 return Result.Failure<int>($"الصندوق '{toBox.NameAr}' لا يدعم العملة {cur}.");
 
             var transitAcc = await _db.Accounts.AsNoTracking()
@@ -377,9 +369,7 @@ public class CreateCashBoxTransferHandler : IRequestHandler<CreateCashBoxTransfe
             if (!transitAcc.IsActive) return Result.Failure<int>($"الحساب الوسيط '{transitAcc.NameAr}' معطّل.");
             if (!transitAcc.IsLeaf) return Result.Failure<int>($"الحساب الوسيط '{transitAcc.NameAr}' حساب رئيسي — اختر حساباً فرعياً.");
 
-            var isTransitLinkedToBox = await _db.CashBoxes.AsNoTracking()
-                .AnyAsync(b => b.AccountId == d.TransitAccountId, ct);
-            if (isTransitLinkedToBox)
+            if (await CashBoxPartySource.IsCashBoxAccountAsync(_db, d.TransitAccountId, ct))
                 return Result.Failure<int>(
                     $"الحساب الوسيط '{transitAcc.NameAr}' مرتبط بصندوق آخر — استخدم حساباً وسيطاً مستقلاً (مثل: نقدية تحت التحويل).");
 
@@ -403,7 +393,7 @@ public class CreateCashBoxTransferHandler : IRequestHandler<CreateCashBoxTransfe
                     new CashBoxGuard.LineSnapshot(fromBox.AccountId, IsDebit: false, d.Amount),
                     new CashBoxGuard.LineSnapshot(d.TransitAccountId, IsDebit: true, d.Amount),
                 },
-                cur, ctOut.Id, excludeJournalEntryId: null, ct);
+                cur, ctOut.Id, excludeJournalEntryId: null, ct, allowTransitAccounts: true);
             if (fromCheck != null) return Result.Failure<int>(fromCheck);
 
             var sendCurCheck = await EnsureCurrencyHasActiveBulletin(cur, d.SendDate, ct);
@@ -448,7 +438,7 @@ public class CreateCashBoxTransferHandler : IRequestHandler<CreateCashBoxTransfe
                 excludeUserId: senderIdStr,
                 title: "مناقلة واردة جديدة",
                 body: $"مناقلة {transfer.TransferNumber} من {fromBox.NameAr} بمبلغ {d.Amount:N0} {cur}",
-                link: "/accounting/cash-boxes?tab=transfers",
+                link: "/accounting/cash-box-transfers",
                 entityType: "CashBoxTransfer",
                 entityId: transfer.Id.ToString(),
                 ct: ct);
@@ -517,7 +507,7 @@ public class CreateCashBoxTransferHandler : IRequestHandler<CreateCashBoxTransfe
     {
         var (fyId, periodId) = await _periods.ResolveAsync(date, ct);
         var nextNum = await _db.GetNextJournalEntryNumberAsync(fyId, ct);
-        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, ct);
+        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, fyId, ct);
 
         var entry = JournalEntry.Create(
             date: date,
@@ -540,9 +530,12 @@ public class CreateCashBoxTransferHandler : IRequestHandler<CreateCashBoxTransfe
             else entry.AddCredit(l.AccountId, l.Amount, l.Desc);
         }
 
-        const string VoucherPostPermission = "Accounting.Vouchers.Post";
-        var canPost = _currentUser.IsSuperAdmin || _currentUser.HasPermission(VoucherPostPermission);
-        if (postImmediately && canPost)
+        // ‎قيود المناقلة تُولَّد بأنواع سندات نظامية مخفية (CT-OUT/CT-IN) لا تملك
+        // ‎واجهة ترحيل يدوية لاحقة، والمستخدم مخوَّل أصلاً بإنشاء/استلام المناقلة.
+        // ‎لذا نُرحّل القيد مباشرةً عند طلب "الترحيل الفوري". (سابقاً كان الفحص يعتمد
+        // ‎صلاحية غير موجودة "Accounting.Vouchers.Post" — لا تُمنح لأي دور — فيبقى
+        // ‎القيد مسودة ولا يُرحَّل، والأرصدة تتجاهل المسودات.)
+        if (postImmediately)
             entry.Post(_currentUser.UserId?.ToString() ?? "system");
 
         await _db.JournalEntries.AddAsync(entry, ct);
@@ -607,8 +600,6 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
         try
         {
             var transfer = await _db.CashBoxTransfers
-                .Include(t => t.FromCashBox)
-                .Include(t => t.ToCashBox)
                 .Include(t => t.TransitAccount)
                 .FirstOrDefaultAsync(t => t.Id == req.TransferId, ct);
             if (transfer == null)
@@ -616,6 +607,14 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
             if (transfer.Status != CashBoxTransferStatus.PendingReceive)
                 return Result.Failure<int>(
                     $"لا يمكن استلام مناقلة حالتها '{transfer.Status}' — يُستَلَم فقط ما هو 'بانتظار الاستلام'.");
+
+            var boxMap = await CashBoxPartySource.GetByIdsAsync(
+                _db, new[] { transfer.FromCashBoxId, transfer.ToCashBoxId }, ct);
+            if (!boxMap.TryGetValue(transfer.ToCashBoxId, out var toBox))
+                return Result.Failure<int>("الصندوق المستلم غير موجود.");
+            boxMap.TryGetValue(transfer.FromCashBoxId, out var fromBox);
+            if (!toBox.IsActive)
+                return Result.Failure<int>($"الصندوق المستلم '{toBox.NameAr}' معطّل — لا يمكن استلام مناقلة فيه.");
 
             var actualReceiveDate = req.Data.ActualReceiveDate ?? DateTime.Now;
             if (actualReceiveDate.Date < transfer.SendDate.Date)
@@ -631,10 +630,6 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
                     $"تاريخ الاستلام ({actualReceiveDate:yyyy-MM-dd}) خارج السنة المالية النشطة '{activeFy.Name}'.");
             }
 
-            var toBox = transfer.ToCashBox!;
-            if (!toBox.IsActive)
-                return Result.Failure<int>($"الصندوق المستلم '{toBox.NameAr}' معطّل — لا يمكن استلام مناقلة فيه.");
-
             await using var tx = await _db.BeginTransactionAsync(ct);
 
             var ctIn = await EnsureSystemVoucherTypeAsync("CT-IN", "تحويل وارد", "Cash Transfer In",
@@ -645,13 +640,13 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
                     new CashBoxGuard.LineSnapshot(toBox.AccountId, IsDebit: true, transfer.Amount),
                     new CashBoxGuard.LineSnapshot(transfer.TransitAccountId, IsDebit: false, transfer.Amount),
                 },
-                transfer.Currency, ctIn.Id, excludeJournalEntryId: null, ct);
+                transfer.Currency, ctIn.Id, excludeJournalEntryId: null, ct, allowTransitAccounts: true);
             if (toCheck != null) return Result.Failure<int>(toCheck);
 
             var recvCurCheck = await EnsureCurrencyHasActiveBulletin(transfer.Currency, actualReceiveDate, ct);
             if (recvCurCheck != null) return Result.Failure<int>(recvCurCheck);
 
-            var refLabel = $"مناقلة {transfer.TransferNumber}: {transfer.FromCashBox?.NameAr ?? "—"} ⇒ {toBox.NameAr}";
+            var refLabel = $"مناقلة {transfer.TransferNumber}: {fromBox?.NameAr ?? "—"} ⇒ {toBox.NameAr}";
 
             var recvEntry = await BuildAndAddJournalEntryAsync(
                 date: actualReceiveDate,
@@ -661,7 +656,7 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
                 lines: new (int AccountId, bool IsDebit, decimal Amount, string? Desc)[]
                 {
                     (toBox.AccountId,            true,  transfer.Amount, $"إيداع في {toBox.NameAr}"),
-                    (transfer.TransitAccountId,  false, transfer.Amount, $"إغلاق التحويل من {transfer.FromCashBox?.NameAr ?? "—"}"),
+                    (transfer.TransitAccountId,  false, transfer.Amount, $"إغلاق التحويل من {fromBox?.NameAr ?? "—"}"),
                 },
                 referenceType: "CashBoxTransfer",
                 referenceNumber: transfer.TransferNumber,
@@ -680,8 +675,8 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
                 cashBoxId: transfer.FromCashBoxId,
                 excludeUserId: receiverIdStr,
                 title: "تم استلام المناقلة",
-                body: $"تم استلام مناقلة {transfer.TransferNumber} في {transfer.ToCashBox?.NameAr ?? ""} بمبلغ {transfer.Amount:N0} {transfer.Currency}",
-                link: "/accounting/cash-boxes?tab=transfers",
+                body: $"تم استلام مناقلة {transfer.TransferNumber} في {toBox.NameAr} بمبلغ {transfer.Amount:N0} {transfer.Currency}",
+                link: "/accounting/cash-box-transfers",
                 entityType: "CashBoxTransfer",
                 entityId: transfer.Id.ToString(),
                 ct: ct);
@@ -719,7 +714,7 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
     {
         var (fyId, periodId) = await _periods.ResolveAsync(date, ct);
         var nextNum = await _db.GetNextJournalEntryNumberAsync(fyId, ct);
-        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, ct);
+        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, fyId, ct);
 
         var entry = JournalEntry.Create(
             date: date, fyId: fyId, periodId: periodId,
@@ -735,9 +730,12 @@ public class ReceiveCashBoxTransferHandler : IRequestHandler<ReceiveCashBoxTrans
             else entry.AddCredit(l.AccountId, l.Amount, l.Desc);
         }
 
-        const string VoucherPostPermission = "Accounting.Vouchers.Post";
-        var canPost = _currentUser.IsSuperAdmin || _currentUser.HasPermission(VoucherPostPermission);
-        if (postImmediately && canPost)
+        // ‎قيود المناقلة تُولَّد بأنواع سندات نظامية مخفية (CT-OUT/CT-IN) لا تملك
+        // ‎واجهة ترحيل يدوية لاحقة، والمستخدم مخوَّل أصلاً بإنشاء/استلام المناقلة.
+        // ‎لذا نُرحّل القيد مباشرةً عند طلب "الترحيل الفوري". (سابقاً كان الفحص يعتمد
+        // ‎صلاحية غير موجودة "Accounting.Vouchers.Post" — لا تُمنح لأي دور — فيبقى
+        // ‎القيد مسودة ولا يُرحَّل، والأرصدة تتجاهل المسودات.)
+        if (postImmediately)
             entry.Post(_currentUser.UserId?.ToString() ?? "system");
 
         await _db.JournalEntries.AddAsync(entry, ct);
@@ -802,8 +800,6 @@ public class CancelCashBoxTransferHandler : IRequestHandler<CancelCashBoxTransfe
         try
         {
             var transfer = await _db.CashBoxTransfers
-                .Include(t => t.FromCashBox)
-                .Include(t => t.ToCashBox)
                 .Include(t => t.TransitAccount)
                 .Include(t => t.SendJournalEntry)
                     .ThenInclude(e => e!.Lines)
@@ -812,6 +808,12 @@ public class CancelCashBoxTransferHandler : IRequestHandler<CancelCashBoxTransfe
             if (transfer.Status != CashBoxTransferStatus.PendingReceive)
                 return Result.Failure<int>(
                     $"لا يمكن إلغاء مناقلة حالتها '{transfer.Status}' — يُلغى فقط 'بانتظار الاستلام'.");
+
+            var boxMap = await CashBoxPartySource.GetByIdsAsync(
+                _db, new[] { transfer.FromCashBoxId, transfer.ToCashBoxId }, ct);
+            if (!boxMap.TryGetValue(transfer.FromCashBoxId, out var fromBox))
+                return Result.Failure<int>("الصندوق المُرسِل غير موجود.");
+            boxMap.TryGetValue(transfer.ToCashBoxId, out var toBox);
 
             var reversalDate = req.Data.ReversalDate ?? DateTime.Now;
             if (reversalDate.Date < transfer.SendDate.Date)
@@ -832,7 +834,7 @@ public class CancelCashBoxTransferHandler : IRequestHandler<CancelCashBoxTransfe
                 VoucherNature.Credit, displayOrder: 200, ct);
 
             var refLabel = $"عكس مناقلة {transfer.TransferNumber}: " +
-                $"{transfer.FromCashBox?.NameAr ?? "—"} ⇒ {transfer.ToCashBox?.NameAr ?? "—"}";
+                $"{fromBox.NameAr} ⇒ {toBox?.NameAr ?? "—"}";
             var reason = string.IsNullOrWhiteSpace(req.Data.Reason) ? "إلغاء قبل الاستلام" : req.Data.Reason!;
 
             // ‎عكس قيد الإرسال: المُرسِل مدين، الحساب الوسيط دائن
@@ -843,7 +845,7 @@ public class CancelCashBoxTransferHandler : IRequestHandler<CancelCashBoxTransfe
                 currency: transfer.Currency,
                 lines: new (int AccountId, bool IsDebit, decimal Amount, string? Desc)[]
                 {
-                    (transfer.FromCashBox!.AccountId, true,  transfer.Amount, $"إعادة إلى {transfer.FromCashBox!.NameAr}"),
+                    (fromBox.AccountId, true,  transfer.Amount, $"إعادة إلى {fromBox.NameAr}"),
                     (transfer.TransitAccountId,        false, transfer.Amount, "إغلاق الحساب الوسيط (إلغاء)"),
                 },
                 referenceType: "CashBoxTransferReversal",
@@ -863,8 +865,8 @@ public class CancelCashBoxTransferHandler : IRequestHandler<CancelCashBoxTransfe
                 cashBoxId: transfer.ToCashBoxId,
                 excludeUserId: cancellerIdStr,
                 title: "تم إلغاء مناقلة",
-                body: $"مناقلة {transfer.TransferNumber} من {transfer.FromCashBox?.NameAr ?? ""} أُلغيت — {reason}",
-                link: "/accounting/cash-boxes?tab=transfers",
+                body: $"مناقلة {transfer.TransferNumber} من {fromBox.NameAr} أُلغيت — {reason}",
+                link: "/accounting/cash-box-transfers",
                 entityType: "CashBoxTransfer",
                 entityId: transfer.Id.ToString(),
                 ct: ct);
@@ -902,7 +904,7 @@ public class CancelCashBoxTransferHandler : IRequestHandler<CancelCashBoxTransfe
     {
         var (fyId, periodId) = await _periods.ResolveAsync(date, ct);
         var nextNum = await _db.GetNextJournalEntryNumberAsync(fyId, ct);
-        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, ct);
+        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, fyId, ct);
 
         var entry = JournalEntry.Create(
             date: date, fyId: fyId, periodId: periodId,
@@ -918,9 +920,12 @@ public class CancelCashBoxTransferHandler : IRequestHandler<CancelCashBoxTransfe
             else entry.AddCredit(l.AccountId, l.Amount, l.Desc);
         }
 
-        const string VoucherPostPermission = "Accounting.Vouchers.Post";
-        var canPost = _currentUser.IsSuperAdmin || _currentUser.HasPermission(VoucherPostPermission);
-        if (postImmediately && canPost)
+        // ‎قيود المناقلة تُولَّد بأنواع سندات نظامية مخفية (CT-OUT/CT-IN) لا تملك
+        // ‎واجهة ترحيل يدوية لاحقة، والمستخدم مخوَّل أصلاً بإنشاء/استلام المناقلة.
+        // ‎لذا نُرحّل القيد مباشرةً عند طلب "الترحيل الفوري". (سابقاً كان الفحص يعتمد
+        // ‎صلاحية غير موجودة "Accounting.Vouchers.Post" — لا تُمنح لأي دور — فيبقى
+        // ‎القيد مسودة ولا يُرحَّل، والأرصدة تتجاهل المسودات.)
+        if (postImmediately)
             entry.Post(_currentUser.UserId?.ToString() ?? "system");
 
         await _db.JournalEntries.AddAsync(entry, ct);
@@ -962,8 +967,6 @@ public class UnreceiveCashBoxTransferHandler : IRequestHandler<UnreceiveCashBoxT
         try
         {
             var transfer = await _db.CashBoxTransfers
-                .Include(t => t.FromCashBox)
-                .Include(t => t.ToCashBox)
                 .Include(t => t.TransitAccount)
                 .Include(t => t.ReceiveJournalEntry)
                 .FirstOrDefaultAsync(t => t.Id == req.TransferId, ct);
@@ -974,7 +977,11 @@ public class UnreceiveCashBoxTransferHandler : IRequestHandler<UnreceiveCashBoxT
             if (!transfer.ReceiveJournalEntryId.HasValue)
                 return Result.Failure<int>("لا يوجد قيد استلام مرتبط بهذه المناقلة — أمر غير متوقَّع.");
 
-            var toBox = transfer.ToCashBox!;
+            var boxMap = await CashBoxPartySource.GetByIdsAsync(
+                _db, new[] { transfer.FromCashBoxId, transfer.ToCashBoxId }, ct);
+            if (!boxMap.TryGetValue(transfer.ToCashBoxId, out var toBox))
+                return Result.Failure<int>("الصندوق المستلم غير موجود.");
+            boxMap.TryGetValue(transfer.FromCashBoxId, out var fromBox);
 
             var reversalDate = req.Data.ReversalDate ?? DateTime.Now;
             // ‎لا يُعكس قبل تاريخ الاستلام الأصلي (وإلا قد ندخل في فترة لم
@@ -1010,11 +1017,11 @@ public class UnreceiveCashBoxTransferHandler : IRequestHandler<UnreceiveCashBoxT
                     new CashBoxGuard.LineSnapshot(toBox.AccountId, IsDebit: false, transfer.Amount),
                     new CashBoxGuard.LineSnapshot(transfer.TransitAccountId, IsDebit: true, transfer.Amount),
                 },
-                transfer.Currency, ctIn.Id, excludeJournalEntryId: null, ct);
+                transfer.Currency, ctIn.Id, excludeJournalEntryId: null, ct, allowTransitAccounts: true);
             if (reverseCheck != null) return Result.Failure<int>(reverseCheck);
 
             var refLabel = $"تراجع عن استلام مناقلة {transfer.TransferNumber}: " +
-                $"{transfer.FromCashBox?.NameAr ?? "—"} ⇒ {toBox.NameAr}";
+                $"{fromBox?.NameAr ?? "—"} ⇒ {toBox.NameAr}";
             var reason = string.IsNullOrWhiteSpace(req.Data.Reason)
                 ? "تراجع عن الاستلام"
                 : req.Data.Reason!;
@@ -1108,7 +1115,7 @@ public class UnreceiveCashBoxTransferHandler : IRequestHandler<UnreceiveCashBoxT
     {
         var (fyId, periodId) = await _periods.ResolveAsync(date, ct);
         var nextNum = await _db.GetNextJournalEntryNumberAsync(fyId, ct);
-        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, ct);
+        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, fyId, ct);
 
         var entry = JournalEntry.Create(
             date: date, fyId: fyId, periodId: periodId,
@@ -1124,9 +1131,12 @@ public class UnreceiveCashBoxTransferHandler : IRequestHandler<UnreceiveCashBoxT
             else entry.AddCredit(l.AccountId, l.Amount, l.Desc);
         }
 
-        const string VoucherPostPermission = "Accounting.Vouchers.Post";
-        var canPost = _currentUser.IsSuperAdmin || _currentUser.HasPermission(VoucherPostPermission);
-        if (postImmediately && canPost)
+        // ‎قيود المناقلة تُولَّد بأنواع سندات نظامية مخفية (CT-OUT/CT-IN) لا تملك
+        // ‎واجهة ترحيل يدوية لاحقة، والمستخدم مخوَّل أصلاً بإنشاء/استلام المناقلة.
+        // ‎لذا نُرحّل القيد مباشرةً عند طلب "الترحيل الفوري". (سابقاً كان الفحص يعتمد
+        // ‎صلاحية غير موجودة "Accounting.Vouchers.Post" — لا تُمنح لأي دور — فيبقى
+        // ‎القيد مسودة ولا يُرحَّل، والأرصدة تتجاهل المسودات.)
+        if (postImmediately)
             entry.Post(_currentUser.UserId?.ToString() ?? "system");
 
         await _db.JournalEntries.AddAsync(entry, ct);
@@ -1170,9 +1180,6 @@ public class UpdateCashBoxTransferHandler : IRequestHandler<UpdateCashBoxTransfe
             if (d.TransitAccountId <= 0) return Result.Failure<int>("الحساب الوسيط مطلوب.");
 
             var transfer = await _db.CashBoxTransfers
-                .Include(t => t.FromCashBox)
-                    .ThenInclude(b => b!.Account)
-                .Include(t => t.ToCashBox)
                 .Include(t => t.SendJournalEntry)
                     .ThenInclude(e => e!.Lines)
                 .FirstOrDefaultAsync(t => t.Id == req.TransferId, ct);
@@ -1183,8 +1190,12 @@ public class UpdateCashBoxTransferHandler : IRequestHandler<UpdateCashBoxTransfe
             if (transfer.SendJournalEntry == null)
                 return Result.Failure<int>("قيد الإرسال غير موجود لهذه المناقلة.");
 
-            var fromBox = transfer.FromCashBox!;
-            var toBox = transfer.ToCashBox!;
+            var boxMap = await CashBoxPartySource.GetByIdsAsync(
+                _db, new[] { transfer.FromCashBoxId, transfer.ToCashBoxId }, ct);
+            if (!boxMap.TryGetValue(transfer.FromCashBoxId, out var fromBox))
+                return Result.Failure<int>("الصندوق المُرسِل غير موجود.");
+            if (!boxMap.TryGetValue(transfer.ToCashBoxId, out var toBox))
+                return Result.Failure<int>("الصندوق المستلم غير موجود.");
             var cur = transfer.Currency;
 
             // ‎التحقق من الحساب الوسيط الجديد
@@ -1194,9 +1205,7 @@ public class UpdateCashBoxTransferHandler : IRequestHandler<UpdateCashBoxTransfe
             if (!transitAcc.IsActive) return Result.Failure<int>($"الحساب الوسيط '{transitAcc.NameAr}' معطّل.");
             if (!transitAcc.IsLeaf)
                 return Result.Failure<int>($"الحساب الوسيط '{transitAcc.NameAr}' حساب رئيسي — اختر حساباً فرعياً.");
-            var isTransitLinked = await _db.CashBoxes.AsNoTracking()
-                .AnyAsync(b => b.AccountId == d.TransitAccountId, ct);
-            if (isTransitLinked)
+            if (await CashBoxPartySource.IsCashBoxAccountAsync(_db, d.TransitAccountId, ct))
                 return Result.Failure<int>(
                     $"الحساب الوسيط '{transitAcc.NameAr}' مرتبط بصندوق آخر — استخدم حساباً وسيطاً مستقلاً.");
 
@@ -1221,7 +1230,7 @@ public class UpdateCashBoxTransferHandler : IRequestHandler<UpdateCashBoxTransfe
                     new CashBoxGuard.LineSnapshot(fromBox.AccountId, IsDebit: false, d.Amount),
                     new CashBoxGuard.LineSnapshot(d.TransitAccountId, IsDebit: true, d.Amount),
                 },
-                cur, ctOut.Id, excludeJournalEntryId: transfer.SendJournalEntryId, ct);
+                cur, ctOut.Id, excludeJournalEntryId: transfer.SendJournalEntryId, ct, allowTransitAccounts: true);
             if (fromCheck != null) return Result.Failure<int>(fromCheck);
 
             var sendCurCheck = await EnsureCurrencyHasActiveBulletin(cur, d.SendDate, ct);
@@ -1237,9 +1246,8 @@ public class UpdateCashBoxTransferHandler : IRequestHandler<UpdateCashBoxTransfe
                 await _db.JournalEntries.AddAsync(rev, ct);
                 if (d.PostImmediately)
                 {
-                    const string VoucherPostPermission = "Accounting.Vouchers.Post";
-                    var canPost = _currentUser.IsSuperAdmin || _currentUser.HasPermission(VoucherPostPermission);
-                    if (canPost) rev.Post(_currentUser.UserId?.ToString() ?? "system");
+                    // ‎ترحيل قيد العكس مباشرةً (سند نظامي بلا واجهة ترحيل يدوية).
+                    rev.Post(_currentUser.UserId?.ToString() ?? "system");
                 }
                 oldEntry.MarkAsReversed(rev.Id);
                 await _db.SaveChangesAsync(ct);
@@ -1309,7 +1317,7 @@ public class UpdateCashBoxTransferHandler : IRequestHandler<UpdateCashBoxTransfe
     {
         var (fyId, periodId) = await _periods.ResolveAsync(date, ct);
         var nextNum = await _db.GetNextJournalEntryNumberAsync(fyId, ct);
-        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, ct);
+        var voucherSeq = await _db.GetNextVoucherSequenceAsync(voucherTypeId, fyId, ct);
 
         var entry = JournalEntry.Create(
             date: date, fyId: fyId, periodId: periodId,
@@ -1325,9 +1333,12 @@ public class UpdateCashBoxTransferHandler : IRequestHandler<UpdateCashBoxTransfe
             else entry.AddCredit(l.AccountId, l.Amount, l.Desc);
         }
 
-        const string VoucherPostPermission = "Accounting.Vouchers.Post";
-        var canPost = _currentUser.IsSuperAdmin || _currentUser.HasPermission(VoucherPostPermission);
-        if (postImmediately && canPost)
+        // ‎قيود المناقلة تُولَّد بأنواع سندات نظامية مخفية (CT-OUT/CT-IN) لا تملك
+        // ‎واجهة ترحيل يدوية لاحقة، والمستخدم مخوَّل أصلاً بإنشاء/استلام المناقلة.
+        // ‎لذا نُرحّل القيد مباشرةً عند طلب "الترحيل الفوري". (سابقاً كان الفحص يعتمد
+        // ‎صلاحية غير موجودة "Accounting.Vouchers.Post" — لا تُمنح لأي دور — فيبقى
+        // ‎القيد مسودة ولا يُرحَّل، والأرصدة تتجاهل المسودات.)
+        if (postImmediately)
             entry.Post(_currentUser.UserId?.ToString() ?? "system");
 
         await _db.JournalEntries.AddAsync(entry, ct);

@@ -1,3 +1,4 @@
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.SharedKernel.Models;
 using MediatR;
@@ -19,6 +20,9 @@ public class PermanentlyDeleteAccountHandler : IRequestHandler<PermanentlyDelete
             return Result.Failure(
                 "الحذف النهائي مسموح فقط للحسابات الموجودة في سلة المهملات. احذف الحساب أولاً.");
 
+        if (await FinancialManagementAccountGuard.IsManagedAccountAsync(_db, req.Id, ct))
+            return Result.Failure(FinancialManagementAccountGuard.ManagedAccountMessage);
+
         // ‎فحوصات دفاعية — لا ينبغي أن تكون لحساب في السلة هذه المراجع، لكن نتأكد
         // ‎كي لا نكسر السلامة المرجعية في حالات استثنائية.
         if (await _db.Accounts.IgnoreQueryFilters().AnyAsync(a => a.ParentId == req.Id, ct))
@@ -28,7 +32,7 @@ public class PermanentlyDeleteAccountHandler : IRequestHandler<PermanentlyDelete
         if (await _db.JournalEntryLines.AnyAsync(l => l.AccountId == req.Id, ct))
             return Result.Failure("لا يمكن الحذف النهائي — للحساب قيود محاسبية مرتبطة.");
 
-        if (await _db.CashBoxes.AnyAsync(b => b.AccountId == req.Id, ct))
+        if (await CashBoxPartySource.IsCashBoxAccountAsync(_db, req.Id, ct))
             return Result.Failure("لا يمكن الحذف النهائي — الحساب مرتبط بصندوق.");
 
         if (await _db.JournalVoucherTypes.AnyAsync(

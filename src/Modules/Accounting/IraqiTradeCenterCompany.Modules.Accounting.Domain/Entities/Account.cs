@@ -61,4 +61,21 @@ public class Account : BaseEntity
     }
 
     public void MarkAsLeaf(bool isLeaf) => IsLeaf = isLeaf;
+
+    /// <summary>
+    /// محجوز للإدارة المالية — الحسابات الفرعية تُضاف تلقائياً من نافذة الموردين/العملاء/المصارف فقط.
+    /// يمنع إضافة أبناء يدويًا عبر شجرة الحسابات.
+    /// </summary>
+    public bool IsLockedForParties { get; private set; }
+
+    public void LockForParties()   => IsLockedForParties = true;
+    public void UnlockForParties() => IsLockedForParties = false;
+
+    /// <summary>
+    /// حساب وسيط للتسوية — لا يظهر رصيده في كشوفات الحسابات/الميزان،
+    /// حركاته تُعرض فقط في نافذة التسوية.
+    /// </summary>
+    public bool IsExcludedFromReports { get; private set; }
+
+    public void SetExcludedFromReports(bool excluded) => IsExcludedFromReports = excluded;
 }

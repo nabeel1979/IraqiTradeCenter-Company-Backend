@@ -91,12 +91,11 @@ public class FiscalYear : BaseEntity
         foreach (var p in Periods) p.ForceOpen();
     }
 
-    /// <summary>تفعيل السنة كنشطة. لا يُسمح بتفعيل سنة مغلقة.</summary>
-    public void Activate()
-    {
-        if (IsClosed) throw new DomainException("لا يمكن تفعيل سنة مالية مغلقة");
-        IsActive = true;
-    }
+    /// <summary>
+    /// تفعيل السنة كنشطة (افتراضية للتقارير والقراءة).
+    /// مسموح حتى لو كانت مغلقة — الإقفال يمنع إنشاء/تعديل القيود فقط.
+    /// </summary>
+    public void Activate() => IsActive = true;
 
     /// <summary>إلغاء تفعيل السنة (للسماح بتفعيل غيرها).</summary>
     public void Deactivate() => IsActive = false;

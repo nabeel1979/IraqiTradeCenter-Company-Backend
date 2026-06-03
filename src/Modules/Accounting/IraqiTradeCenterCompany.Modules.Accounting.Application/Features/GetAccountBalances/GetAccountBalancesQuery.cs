@@ -21,5 +21,7 @@ public record GetAccountBalancesQuery(
     /// <summary>true = أوراق الشجرة فقط</summary>
     bool LeavesOnly = true,
     /// <summary>true = تضمين القيود غير المُرحَّلة</summary>
-    bool IncludeDraft = false
+    bool IncludeDraft = false,
+    /// <summary>true = تضمين القيود الافتتاحية (Opening) مع احترام تاريخها</summary>
+    bool IncludeOpeningEntries = true
 ) : IRequest<AccountBalancesDto>;

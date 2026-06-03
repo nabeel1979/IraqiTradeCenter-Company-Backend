@@ -1,4 +1,5 @@
 using System.Text;
+using System.Threading.RateLimiting;
 using IraqiTradeCenterCompany.API.Auth;
 using IraqiTradeCenterCompany.API.Auth.Permissions;
 using IraqiTradeCenterCompany.API.Extensions;
@@ -20,6 +21,7 @@ using IraqiTradeCenterCompany.SharedKernel.Behaviors;
 using IraqiTradeCenterCompany.SharedKernel.Interfaces;
 using MediatR;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
@@ -57,6 +59,11 @@ builder.Services.AddDbContext<AuthDbContext>(opt =>
 
 // Permissions service + كاش في الذاكرة
 builder.Services.AddMemoryCache();
+// إعدادات حماية تسجيل الدخول (قابلة للضبط من قسم Security:Login)
+builder.Services.Configure<LoginSecurityOptions>(
+    builder.Configuration.GetSection(LoginSecurityOptions.SectionName));
+// قفل حساب مؤقت ضد هجمات تخمين كلمة المرور (يعتمد على IMemoryCache أعلاه)
+builder.Services.AddSingleton<ILoginThrottle, LoginThrottle>();
 builder.Services.AddScoped<IPermissionService, PermissionService>();
 builder.Services.AddScoped<IVoucherTypePermissionsSync, VoucherTypePermissionsSync>();
 builder.Services.AddUnifiedTrash();
@@ -87,10 +94,22 @@ builder.Services.Configure<IraqiTradeCenterCompany.API.Attachments.AttachmentSto
     builder.Configuration.GetSection(IraqiTradeCenterCompany.API.Attachments.AttachmentStorageOptions.SectionName));
 builder.Services.AddScoped<IraqiTradeCenterCompany.API.Settings.IAttachmentSettingsService,
     IraqiTradeCenterCompany.API.Settings.AttachmentSettingsService>();
+builder.Services.AddScoped<IraqiTradeCenterCompany.API.Settings.IMediaBackupSettingsService,
+    IraqiTradeCenterCompany.API.Settings.MediaBackupSettingsService>();
+builder.Services.AddScoped<IraqiTradeCenterCompany.API.Settings.IMediaBackupRunner,
+    IraqiTradeCenterCompany.API.Settings.MediaBackupRunner>();
 builder.Services.AddScoped<IraqiTradeCenterCompany.API.Attachments.LocalDiskAttachmentStorage>();
 builder.Services.AddScoped<IraqiTradeCenterCompany.API.Attachments.R2AttachmentStorage>();
 builder.Services.AddScoped<IraqiTradeCenterCompany.API.Attachments.IAttachmentStorageRegistry,
     IraqiTradeCenterCompany.API.Attachments.AttachmentStorageRegistry>();
+builder.Services.AddScoped<IVoucherAttachmentDeletionService,
+    IraqiTradeCenterCompany.API.Attachments.VoucherAttachmentDeletionService>();
+builder.Services.AddScoped<IraqiTradeCenterCompany.API.Attachments.VoucherAttachmentDeletionService>();
+
+// ‎خدمة خلفية لمزامنة المرفقات: محلي ⇄ R2 كل دقيقة، مع مسح المحلي بعد 24س.
+builder.Services.AddHostedService<IraqiTradeCenterCompany.API.Attachments.AttachmentSyncBackgroundService>();
+// ‎جدولة النسخ الاحتياطي لقاعدة البيانات (حسب AutoBackupCron).
+builder.Services.AddHostedService<IraqiTradeCenterCompany.API.Settings.MediaBackupBackgroundService>();
 
 // 5) Controllers
 builder.Services.AddControllers();
@@ -115,6 +134,39 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 builder.Services.AddAuthorization();
+
+// 6.b) Rate Limiting — حماية نقطة تسجيل الدخول من هجمات brute-force حسب عنوان IP.
+//      القيم قابلة للضبط من قسم Security:Login:IpRateLimit في appsettings.
+var loginSecurity = builder.Configuration.GetSection(LoginSecurityOptions.SectionName)
+    .Get<LoginSecurityOptions>() ?? new LoginSecurityOptions();
+var ipPermitLimit = loginSecurity.IpRateLimit.PermitLimit > 0 ? loginSecurity.IpRateLimit.PermitLimit : 10;
+var ipWindowSeconds = loginSecurity.IpRateLimit.WindowSeconds > 0 ? loginSecurity.IpRateLimit.WindowSeconds : 60;
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("login", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = ipPermitLimit,
+                Window = TimeSpan.FromSeconds(ipWindowSeconds),
+                QueueLimit = 0
+            }));
+    options.OnRejected = async (context, token) =>
+    {
+        var retryAfterSeconds = 60;
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+            retryAfterSeconds = (int)retryAfter.TotalSeconds;
+        context.HttpContext.Response.Headers["Retry-After"] = retryAfterSeconds.ToString();
+        context.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        await context.HttpContext.Response.WriteAsJsonAsync(new
+        {
+            success = false,
+            errors = new[] { "عدد محاولات الدخول كبير جداً. الرجاء المحاولة بعد قليل." }
+        }, token);
+    };
+});
 
 // 7) CORS — في Development يسمح لكل الأصول، في Production يقرأ القائمة من الإعدادات
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>();
@@ -164,6 +216,7 @@ try
 
     var authDb = sp.GetRequiredService<AuthDbContext>();
 
+    await AuthSchemaBootstrapper.EnsureAsync(builder.Configuration);
     await authDb.Database.MigrateAsync();
     await accountingDb.Database.MigrateAsync();
     await inventoryDb.Database.MigrateAsync();
@@ -172,6 +225,7 @@ try
     // 1) Seed المحاسبي أولاً ليكون لدينا voucher types (إن وُجدت) قبل مزامنة الصلاحيات
     await ChartOfAccountsSeeder.SeedAsync(accountingDb);
     await FiscalYearSeeder.SeedAsync(accountingDb);
+    await AccountSettlementSettingsSeeder.SeedAsync(accountingDb);
 
     // 1.b) تعبئة NameEn لكل الحسابات/أنواع السندات/الصناديق التي أُدخلت
     //      قبل دعم اللغة الإنجليزية — حتى تعمل واجهة EN بدون نصوص عربية متناثرة.
@@ -221,6 +275,8 @@ var corsPolicy = allowedOrigins is { Length: > 0 } ? "AllowFrontends" : "AllowAl
 app.UseCors(corsPolicy);
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
+app.UseMiddleware<MustChangePasswordMiddleware>();
 
 // ‎حجب الـ API بعد المصادقة وقبل الـ controllers — كي يبقى من تسجيل الدخول
 // ‎مفتوحاً وكي نسمح فقط بـ /api/license/* وما يلزم لتطبيق شفرة جديدة.

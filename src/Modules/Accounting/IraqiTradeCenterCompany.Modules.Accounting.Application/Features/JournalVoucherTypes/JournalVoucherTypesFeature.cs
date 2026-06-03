@@ -27,7 +27,9 @@ public record JournalVoucherTypeDto(
     bool IsSystem,
     int DisplayOrder,
     string Nature,
-    bool ShowInSidebar
+    bool ShowInSidebar,
+    int LinkedEntryCount,
+    bool CanDelete
 );
 
 public record UpsertJournalVoucherTypeDto(
@@ -47,7 +49,7 @@ public record UpsertJournalVoucherTypeDto(
 // Queries
 // ─────────────────────────────────────────────────────────────────────
 
-public record GetJournalVoucherTypesQuery(bool? EnabledOnly = null) : IRequest<List<JournalVoucherTypeDto>>;
+public record GetJournalVoucherTypesQuery(bool? EnabledOnly = null, bool ManagementOnly = false) : IRequest<List<JournalVoucherTypeDto>>;
 
 public class GetJournalVoucherTypesHandler : IRequestHandler<GetJournalVoucherTypesQuery, List<JournalVoucherTypeDto>>
 {
@@ -62,15 +64,26 @@ public class GetJournalVoucherTypesHandler : IRequestHandler<GetJournalVoucherTy
             .AsQueryable();
 
         if (req.EnabledOnly == true) q = q.Where(x => x.IsEnabled);
+        // ‎إخفاء أنواع نظامية داخلية (CT-OUT/CT-IN …) من شاشة الإدارة
+        if (req.ManagementOnly) q = q.Where(x => !x.IsSystem || x.ShowInSidebar);
 
         var rows = await q
             .OrderBy(x => x.DisplayOrder).ThenBy(x => x.Code)
             .ToListAsync(ct);
 
-        return rows.Select(MapToDto).ToList();
+        var typeIds = rows.Select(x => x.Id).ToList();
+        var usageCounts = typeIds.Count == 0
+            ? new Dictionary<int, int>()
+            : await _db.JournalEntries.AsNoTracking()
+                .Where(e => e.VoucherTypeId != null && typeIds.Contains(e.VoucherTypeId.Value))
+                .GroupBy(e => e.VoucherTypeId!.Value)
+                .Select(g => new { TypeId = g.Key, Count = g.Count() })
+                .ToDictionaryAsync(x => x.TypeId, x => x.Count, ct);
+
+        return rows.Select(x => MapToDto(x, usageCounts.GetValueOrDefault(x.Id))).ToList();
     }
 
-    public static JournalVoucherTypeDto MapToDto(JournalVoucherType x) => new(
+    public static JournalVoucherTypeDto MapToDto(JournalVoucherType x, int linkedEntryCount = 0) => new(
         x.Id,
         x.Code,
         x.NameAr,
@@ -86,7 +99,25 @@ public class GetJournalVoucherTypesHandler : IRequestHandler<GetJournalVoucherTy
         x.IsSystem,
         x.DisplayOrder,
         x.Nature.ToString(),
-        x.ShowInSidebar);
+        x.ShowInSidebar,
+        linkedEntryCount,
+        CanDeleteVoucherType(x, linkedEntryCount));
+
+    /// <summary>
+    /// ‎أنواع غير المفعّلة وغير المرتبطة بقيود يمكن حذفها — بما فيها الأنواع النظامية.
+    /// ‎الأنواع المخصصة المفعّلة يمكن حذفها أيضاً إذا لم تُستخدم.
+    /// </summary>
+    internal static bool CanDeleteVoucherType(JournalVoucherType x, int linkedEntryCount)
+    {
+        if (linkedEntryCount > 0)
+        {
+            // ‎أنواع نظامية معطّلة: يُفكّ ارتباط القيود عند الحذف (قيود المناقلات تبقى).
+            if (x.IsSystem && !x.IsEnabled) return true;
+            return false;
+        }
+        if (x.IsSystem) return !x.IsEnabled;
+        return true;
+    }
 }
 
 internal static class VoucherNatureParser
@@ -116,7 +147,10 @@ public class GetJournalVoucherTypeByIdHandler : IRequestHandler<GetJournalVouche
             .Include(t => t.DefaultDebitAccount)
             .Include(t => t.DefaultCreditAccount)
             .FirstOrDefaultAsync(t => t.Id == req.Id, ct);
-        return x == null ? null : GetJournalVoucherTypesHandler.MapToDto(x);
+        if (x == null) return null;
+        var linked = await _db.JournalEntries.AsNoTracking()
+            .CountAsync(e => e.VoucherTypeId == x.Id, ct);
+        return GetJournalVoucherTypesHandler.MapToDto(x, linked);
     }
 }
 
@@ -240,8 +274,27 @@ public class DeleteJournalVoucherTypeHandler : IRequestHandler<DeleteJournalVouc
         var entity = await _db.JournalVoucherTypes.FirstOrDefaultAsync(x => x.Id == req.Id, ct)
             ?? throw new DomainException("نوع السند غير موجود");
 
-        if (entity.IsSystem)
-            throw new DomainException("لا يمكن حذف نوع سند مدمج بالنظام");
+        var linkedEntryCount = await _db.JournalEntries
+            .CountAsync(e => e.VoucherTypeId == req.Id, ct);
+
+        if (linkedEntryCount > 0)
+        {
+            if (entity.IsSystem && !entity.IsEnabled)
+            {
+                var linked = await _db.JournalEntries
+                    .Where(e => e.VoucherTypeId == req.Id)
+                    .ToListAsync(ct);
+                foreach (var entry in linked)
+                    entry.DetachVoucherType();
+            }
+            else
+            {
+                throw new DomainException("لا يمكن حذف نوع السند — مرتبط بقيود أو عمليات");
+            }
+        }
+
+        if (entity.IsSystem && entity.IsEnabled)
+            throw new DomainException("لا يمكن حذف نوع سند نظامي مفعّل. عطّله أولاً إذا لم يُستخدم.");
 
         // Soft delete (يحترم QueryFilter !IsDeleted)
         entity.MarkAsDeleted();

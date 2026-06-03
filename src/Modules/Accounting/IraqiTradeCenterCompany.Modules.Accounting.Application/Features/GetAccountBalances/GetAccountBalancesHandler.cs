@@ -1,4 +1,5 @@
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Dtos;
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using MediatR;
@@ -23,20 +24,6 @@ public class GetAccountBalancesHandler : IRequestHandler<GetAccountBalancesQuery
         cmd.Parameters.Add(p);
     }
 
-    private static decimal GetMultiplier(
-        string? lineCurrency, string baseCurrency,
-        IReadOnlyDictionary<string, (decimal Rate, int Operation)> rates,
-        ref bool usedFallback)
-    {
-        var b = baseCurrency.Trim().ToUpperInvariant();
-        var c = string.IsNullOrWhiteSpace(lineCurrency) ? b : lineCurrency.Trim().ToUpperInvariant();
-        if (c == b) return 1m;
-        if (rates.TryGetValue(c, out var entry) && entry.Rate > 0)
-            return entry.Operation == 2 ? 1m / entry.Rate : entry.Rate;
-        usedFallback = true;
-        return 1m;
-    }
-
     public async Task<AccountBalancesDto> Handle(GetAccountBalancesQuery req, CancellationToken ct)
     {
         var fromDate = req.FromDate.Date;
@@ -56,6 +43,7 @@ public class GetAccountBalancesHandler : IRequestHandler<GetAccountBalancesQuery
             .OrderByDescending(f => f.StartDate).FirstOrDefaultAsync(ct)
             ?? await _db.FiscalYears.AsNoTracking().FirstOrDefaultAsync(f => f.IsActive, ct);
         if (fy != null) plFyStart = fy.StartDate.Date;
+        var includePriorOpening = !plFyStart.HasValue || fromDate > plFyStart.Value;
 
         // ── نشرة الأسعار للتقويم
         string baseCur = "IQD";
@@ -81,11 +69,16 @@ public class GetAccountBalancesHandler : IRequestHandler<GetAccountBalancesQuery
             }
         }
 
-        // ── جلب شجرة الحسابات
+        // ── جلب شجرة الحسابات (للعرض) + كل الأوراق النشطة (للإجماليات)
         var allAccounts = await _db.Accounts.AsNoTracking()
-            .Where(a => a.IsActive)
+            .Where(a => a.IsActive && !a.IsExcludedFromReports)
             .OrderBy(a => a.Code)
             .Select(a => new { a.Id, a.Code, a.NameAr, a.Type, a.Nature, a.Level, a.IsLeaf, a.ParentId })
+            .ToListAsync(ct);
+
+        var allActiveLeaves = await _db.Accounts.AsNoTracking()
+            .Where(a => a.IsActive && a.IsLeaf)
+            .Select(a => a.Id)
             .ToListAsync(ct);
 
         // ── فلتر بالحساب المحدد وأحفاده
@@ -125,7 +118,7 @@ public class GetAccountBalancesHandler : IRequestHandler<GetAccountBalancesQuery
         var statusStr = string.Join(",", statusInts);
 
         var openingSql = $@"
-SELECT l.AccountId, e.Currency,
+SELECT l.AccountId, e.Currency, e.ManualExchangeRate, e.ManualExchangeRateOperation,
        ISNULL(SUM(CASE WHEN l.IsDebit=1 THEN l.Amount ELSE 0 END),0) AS Dr,
        ISNULL(SUM(CASE WHEN l.IsDebit=0 THEN l.Amount ELSE 0 END),0) AS Cr
 FROM acc.JournalEntryLines l
@@ -133,16 +126,12 @@ INNER JOIN acc.JournalEntries e ON e.Id=l.JournalEntryId
 INNER JOIN acc.Accounts a       ON a.Id=l.AccountId
 WHERE l.IsDeleted=0 AND e.IsDeleted=0
   AND e.[Status] IN ({statusStr})
-  AND (
-    (a.[Type] IN (1,2,3) AND ((e.EntryType=1 AND e.EntryDate<@from) OR (e.EntryType=2 AND e.EntryDate<=@to)))
-    OR
-    (a.[Type] IN (4,5) AND e.EntryType=1 AND e.EntryDate<@from AND (@plFyStart IS NULL OR e.EntryDate>=@plFyStart))
-  )
+  AND {ReportEntrySqlFragments.TrialBalanceOpeningBalanceWhere(req.IncludeOpeningEntries, includePriorOpening)}
   AND (@currency IS NULL OR UPPER(e.Currency)=@currency)
-GROUP BY l.AccountId, e.Currency;";
+GROUP BY l.AccountId, e.Currency, e.ManualExchangeRate, e.ManualExchangeRateOperation;";
 
         var periodSql = $@"
-SELECT l.AccountId, e.Currency,
+SELECT l.AccountId, e.Currency, e.ManualExchangeRate, e.ManualExchangeRateOperation,
        ISNULL(SUM(CASE WHEN l.IsDebit=1 THEN l.Amount ELSE 0 END),0) AS Dr,
        ISNULL(SUM(CASE WHEN l.IsDebit=0 THEN l.Amount ELSE 0 END),0) AS Cr
 FROM acc.JournalEntryLines l
@@ -150,22 +139,24 @@ INNER JOIN acc.JournalEntries e ON e.Id=l.JournalEntryId
 INNER JOIN acc.Accounts a       ON a.Id=l.AccountId
 WHERE l.IsDeleted=0 AND e.IsDeleted=0
   AND e.[Status] IN ({statusStr})
-  AND e.EntryType=1
+  AND {ReportEntrySqlFragments.PeriodEntryTypeFilter(req.IncludeOpeningEntries)}
   AND e.EntryDate>=@from AND e.EntryDate<=@to
-  AND (a.[Type] IN (1,2,3) OR (a.[Type] IN (4,5) AND (@plFyStart IS NULL OR e.EntryDate>=@plFyStart)))
   AND (@currency IS NULL OR UPPER(e.Currency)=@currency)
-GROUP BY l.AccountId, e.Currency;";
+GROUP BY l.AccountId, e.Currency, e.ManualExchangeRate, e.ManualExchangeRateOperation;";
 
-        var openingByAccCcy = new Dictionary<(int, string), (decimal Dr, decimal Cr)>();
-        var periodByAccCcy  = new Dictionary<(int, string), (decimal Dr, decimal Cr)>();
+        // المفتاح: (الحساب، العملة، السعر اليدوي، العملية) — البُعد الإضافي يفصل القيود
+        // ذات السعر التاريخي الخاص لتُقيَّم بمضاعِفها بدل مضاعِف النشرة الموحَّد.
+        var openingByAccCcy = new Dictionary<(int Acc, string Ccy, decimal? Rate, int? Op), (decimal Dr, decimal Cr)>();
+        var periodByAccCcy  = new Dictionary<(int Acc, string Ccy, decimal? Rate, int? Op), (decimal Dr, decimal Cr)>();
 
         var conn = _db.GetDbConnection();
         if (conn.State != System.Data.ConnectionState.Open) await conn.OpenAsync(ct);
 
-        async Task FillAsync(string sql, Dictionary<(int, string), (decimal, decimal)> target)
+        async Task FillAsync(string sql, Dictionary<(int, string, decimal?, int?), (decimal, decimal)> target)
         {
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = sql;
+            _db.ConfigureDbCommand(cmd);
             AddParam(cmd, "@from",      fromDate);
             AddParam(cmd, "@to",        toDate);
             AddParam(cmd, "@currency",  (object?)currencyFilter ?? DBNull.Value);
@@ -175,7 +166,9 @@ GROUP BY l.AccountId, e.Currency;";
             {
                 var accId = rdr.GetInt32(0);
                 var ccy = (rdr.IsDBNull(1) ? "" : rdr.GetString(1)).Trim().ToUpperInvariant();
-                target[(accId, ccy)] = (rdr.GetDecimal(2), rdr.GetDecimal(3));
+                var rate = rdr.IsDBNull(2) ? (decimal?)null : rdr.GetDecimal(2);
+                var op = rdr.IsDBNull(3) ? (int?)null : rdr.GetInt32(3);
+                target[(accId, ccy, rate, op)] = (rdr.GetDecimal(4), rdr.GetDecimal(5));
             }
         }
 
@@ -186,15 +179,15 @@ GROUP BY l.AccountId, e.Currency;";
         if (!req.LeavesOnly)
         {
             var parentMap = allAccounts.ToDictionary(a => a.Id, a => a.ParentId);
-            void Bubble(Dictionary<(int, string), (decimal, decimal)> src)
+            void Bubble(Dictionary<(int Acc, string Ccy, decimal? Rate, int? Op), (decimal, decimal)> src)
             {
                 var leafKeys = src.ToList();
                 foreach (var kv in leafKeys)
                 {
-                    if (!parentMap.TryGetValue(kv.Key.Item1, out var pid)) continue;
+                    if (!parentMap.TryGetValue(kv.Key.Acc, out var pid)) continue;
                     while (pid.HasValue)
                     {
-                        var pk = (pid.Value, kv.Key.Item2);
+                        var pk = (pid.Value, kv.Key.Ccy, kv.Key.Rate, kv.Key.Op);
                         var prev = src.TryGetValue(pk, out var pv) ? pv : (0m, 0m);
                         src[pk] = (prev.Item1 + kv.Value.Item1, prev.Item2 + kv.Value.Item2);
                         if (!parentMap.TryGetValue(pid.Value, out var next)) break;
@@ -206,31 +199,43 @@ GROUP BY l.AccountId, e.Currency;";
             Bubble(periodByAccCcy);
         }
 
-        // ── بناء الصفوف
+        // ── بناء الصفوف + الإجماليات
         var rows = new List<AccountBalanceRowDto>();
         decimal totDr = 0, totCr = 0, totValDr = 0, totValCr = 0;
 
-        // نجمع كل عملات كل حساب
         var allKeys = openingByAccCcy.Keys.Concat(periodByAccCcy.Keys).Distinct().ToList();
+
+        // يحسب لحسابٍ وعملةٍ: الصافي بالعملة الأجنبية + الصافي المقوَّم بالعملة الأساسية،
+        // مع تقييم كل سلّة (سعر يدوي/نشرة) على حدة ثم جمعها.
+        (decimal foreignNet, decimal valuatedNet) NetForAccountCurrency(int accId, string ccy)
+        {
+            decimal fNet = 0m, vNet = 0m;
+            foreach (var key in allKeys.Where(k => k.Acc == accId && k.Ccy == ccy))
+            {
+                var (oDr, oCr) = openingByAccCcy.TryGetValue(key, out var ov) ? ov : (0m, 0m);
+                var (pDr, pCr) = periodByAccCcy.TryGetValue(key, out var pv) ? pv : (0m, 0m);
+                var basketNet = (oDr + pDr) - (oCr + pCr);
+                fNet += basketNet;
+                var mult = req.Valuated
+                    ? FxValuation.Multiplier(ccy, baseCur, key.Rate, key.Op, rates, ref fxFallback)
+                    : 1m;
+                vNet += basketNet * mult;
+            }
+            return (fNet, vNet);
+        }
 
         foreach (var acc in displayAccounts)
         {
-            var ccys = allKeys.Where(k => k.Item1 == acc.Id).Select(k => k.Item2).Distinct().ToList();
-            if (ccys.Count == 0) continue; // لا حركة
+            var ccys = allKeys.Where(k => k.Acc == acc.Id).Select(k => k.Ccy).Distinct().ToList();
+            if (ccys.Count == 0) continue;
 
             foreach (var ccy in ccys.OrderBy(c => c))
             {
-                var opKey  = (acc.Id, ccy);
-                var (oDr, oCr) = openingByAccCcy.TryGetValue(opKey, out var ov) ? ov : (0m, 0m);
-                var (pDr, pCr) = periodByAccCcy.TryGetValue(opKey, out var pv) ? pv : (0m, 0m);
-
-                var net = (oDr + pDr) - (oCr + pCr);
+                var (net, valNet) = NetForAccountCurrency(acc.Id, ccy);
                 var debit  = net > 0 ? net  : 0m;
                 var credit = net < 0 ? -net : 0m;
-
-                var mult = req.Valuated ? GetMultiplier(ccy, baseCur, rates, ref fxFallback) : 1m;
-                var valDr = debit  * mult;
-                var valCr = credit * mult;
+                var valDr = valNet > 0 ? valNet  : 0m;
+                var valCr = valNet < 0 ? -valNet : 0m;
 
                 rows.Add(new AccountBalanceRowDto
                 {
@@ -248,11 +253,20 @@ GROUP BY l.AccountId, e.Currency;";
                     ValuatedDebit = valDr,
                     ValuatedCredit= valCr,
                 });
+            }
+        }
 
-                totDr    += debit;
-                totCr    += credit;
-                totValDr += valDr;
-                totValCr += valCr;
+        // الإجماليات تشمل حسابات الوسيط المخفية (تسوية الحسابات)
+        foreach (var accId in allActiveLeaves)
+        {
+            var ccys = allKeys.Where(k => k.Acc == accId).Select(k => k.Ccy).Distinct().ToList();
+            foreach (var ccy in ccys)
+            {
+                var (net, valNet) = NetForAccountCurrency(accId, ccy);
+                totDr += net > 0 ? net : 0m;
+                totCr += net < 0 ? -net : 0m;
+                totValDr += valNet > 0 ? valNet : 0m;
+                totValCr += valNet < 0 ? -valNet : 0m;
             }
         }
 

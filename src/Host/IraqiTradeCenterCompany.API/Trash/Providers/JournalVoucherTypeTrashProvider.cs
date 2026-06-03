@@ -51,8 +51,6 @@ public class JournalVoucherTypeTrashProvider : ITrashProvider
             .FirstOrDefaultAsync(v => v.Id == id, ct);
         if (entity is null) return Result.Failure("نوع السند غير موجود");
         if (!entity.IsDeleted) return Result.Failure("الحذف النهائي مسموح فقط من السلة");
-        if (entity.IsSystem)
-            return Result.Failure("لا يمكن الحذف النهائي لنوع سند نظامي.");
 
         var refByEntry = await _db.JournalEntries.IgnoreQueryFilters()
             .AnyAsync(e => e.VoucherTypeId == id, ct);

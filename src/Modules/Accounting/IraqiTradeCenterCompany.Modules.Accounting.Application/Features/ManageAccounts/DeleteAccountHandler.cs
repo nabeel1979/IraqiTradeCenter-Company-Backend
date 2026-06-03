@@ -1,3 +1,4 @@
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.SharedKernel.Models;
 using MediatR;
@@ -23,6 +24,9 @@ public class DeleteAccountHandler : IRequestHandler<DeleteAccountCommand, Result
         var account = await _db.Accounts.FirstOrDefaultAsync(a => a.Id == req.Id, ct);
         if (account is null) return Result.Failure("الحساب غير موجود");
 
+        if (await FinancialManagementAccountGuard.IsManagedAccountAsync(_db, req.Id, ct))
+            return Result.Failure(FinancialManagementAccountGuard.ManagedAccountMessage);
+
         // 1) لا يمكن حذف حساب له أبناء (نشطون — المحذوفون في السلة لا يُحتسبون)
         var hasChildren = await _db.Accounts.AnyAsync(a => a.ParentId == req.Id, ct);
         if (hasChildren)
@@ -33,16 +37,19 @@ public class DeleteAccountHandler : IRequestHandler<DeleteAccountCommand, Result
         if (hasJournalLines)
             return Result.Failure("لا يمكن حذف الحساب — مستخدم في قيود محاسبية. يمكنك تعطيله بدلاً من ذلك.");
 
-        // 3) لا يمكن حذف حساب مرتبط بصندوق
-        var linkedToCashBox = await _db.CashBoxes.AnyAsync(b => b.AccountId == req.Id, ct);
+        // 3) لا يمكن حذف حساب مرتبط بصندوق (أو أي طرف مالي آخر — مُغطّى أعلاه)
+        var linkedToCashBox = await CashBoxPartySource.IsCashBoxAccountAsync(_db, req.Id, ct);
         if (linkedToCashBox)
-            return Result.Failure("لا يمكن حذف الحساب — مرتبط بصندوق. احذف الصندوق أو غيِّر حسابه أولاً.");
+            return Result.Failure("لا يمكن حذف الحساب — مرتبط بصندوق في الإدارة المالية. احذف الطرف أو غيِّر حسابه أولاً.");
 
         // 4) لا يمكن حذف حساب مستخدم كحساب افتراضي لنوع سند
         var linkedToVoucherType = await _db.JournalVoucherTypes.AnyAsync(
             v => v.DefaultDebitAccountId == req.Id || v.DefaultCreditAccountId == req.Id, ct);
         if (linkedToVoucherType)
             return Result.Failure("لا يمكن حذف الحساب — مستخدم كحساب افتراضي في نوع سند. غيِّر الإعداد أولاً.");
+
+        if (await AccountSettlementLinkedSource.IsLinkedAccountAsync(_db, req.Id, ct))
+            return Result.Failure("لا يمكن حذف الحساب — مرتبط بإعدادات تسوية الحسابات. غيِّر الإعداد أولاً.");
 
         // 5) لا يمكن حذف حساب فيه رصيد افتتاحي
         if (account.OpeningBalance != 0)

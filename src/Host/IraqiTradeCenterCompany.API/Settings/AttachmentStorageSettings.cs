@@ -35,6 +35,11 @@ public class AttachmentStorageSettings
 
     public string? R2Bucket { get; set; }
 
+    /// <summary>
+    /// اختصاص R2 لبناء الـ endpoint: <c>default</c> (عالمي) أو <c>eu</c> (الاتحاد الأوروبي).
+    /// </summary>
+    public string R2Jurisdiction { get; set; } = "default";
+
     /// <summary>اختياري: عنوان عام أمام R2 (Worker / Custom Domain) — لاستعمال روابط مباشرة لاحقاً.</summary>
     public string? R2PublicBaseUrl { get; set; }
 

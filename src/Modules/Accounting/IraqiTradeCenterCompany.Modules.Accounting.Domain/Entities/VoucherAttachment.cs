@@ -52,6 +52,12 @@ public class VoucherAttachment : BaseEntity
     /// <summary>ملاحظة اختيارية (سبب الرفع، مصدر الوثيقة، …).</summary>
     public string? Notes { get; private set; }
 
+    /// <summary>هل النسخة المحلّية موجودة على قرص الخادم؟ تُمسح بعد 24 ساعة من رفعها لـ R2.</summary>
+    public bool IsOnLocal { get; private set; } = true;
+
+    /// <summary>هل تمّ نسخ الملف إلى Cloudflare R2؟ يضبطه السيرفس الخلفي بعد نجاح الرفع.</summary>
+    public bool IsOnR2 { get; private set; }
+
     private VoucherAttachment() { }
 
     public static VoucherAttachment Create(
@@ -98,6 +104,12 @@ public class VoucherAttachment : BaseEntity
     {
         Notes = string.IsNullOrWhiteSpace(newNotes) ? null : Truncate(newNotes.Trim(), 500);
     }
+
+    /// <summary>تأشير أن الملف صار موجوداً على R2 (يستدعى من سيرفس المزامنة).</summary>
+    public void MarkUploadedToR2() => IsOnR2 = true;
+
+    /// <summary>تأشير أن النسخة المحلّية حُذفت بعد التحقّق من R2.</summary>
+    public void MarkLocalPurged() => IsOnLocal = false;
 
     private static string Truncate(string value, int max)
         => value.Length <= max ? value : value[..max];

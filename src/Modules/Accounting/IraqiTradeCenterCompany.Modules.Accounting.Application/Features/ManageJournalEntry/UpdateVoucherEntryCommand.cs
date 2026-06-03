@@ -26,7 +26,11 @@ public record UpdateVoucherEntryCommand(
     List<UpdateJournalLine> Lines,
     bool PostImmediately = true,
     /// <summary>الرقم اليدوي للسند (شيك، إيصال خارجي، …).</summary>
-    string? ManualNumber = null
+    string? ManualNumber = null,
+    /// <summary>سعر صرف يدوي اختياري (يُستخدم حين لا توجد نشرة تُسعّر العملة بتاريخ السند).</summary>
+    decimal? ManualExchangeRate = null,
+    /// <summary>عملية السعر اليدوي: 1=ضرب (افتراضي)، 2=قسمة.</summary>
+    int? ManualExchangeRateOperation = null
 ) : IRequest<Result<int>>;
 
 public class UpdateVoucherEntryHandler : IRequestHandler<UpdateVoucherEntryCommand, Result<int>>
@@ -101,8 +105,9 @@ public class UpdateVoucherEntryHandler : IRequestHandler<UpdateVoucherEntryComma
             var nonLeaf = accounts.FirstOrDefault(a => !a.IsLeaf);
             if (nonLeaf != null) return Result.Failure<int>($"الحساب '{nonLeaf.NameAr}' حساب رئيسي - لا يقبل قيوداً");
 
-            // التحقق من تسعير العملة
-            var currencyCheck = await EnsureCurrencyHasActiveBulletin(req.Currency, req.EntryDate, ct);
+            // التحقق من تسعير العملة (يُسمح بسعر صرف يدوي عند غياب النشرة)
+            var currencyCheck = await CurrencyBulletinGuard.CheckAsync(
+                _db, req.Currency, req.EntryDate, req.ManualExchangeRate, ct);
             if (currencyCheck != null) return Result.Failure<int>(currencyCheck);
 
             // ‎فحص قواعد الصناديق (سقوف + منع استخدامها في قيد غير سند)
@@ -115,12 +120,18 @@ public class UpdateVoucherEntryHandler : IRequestHandler<UpdateVoucherEntryComma
                 ct);
             if (cashBoxCheck != null) return Result.Failure<int>(cashBoxCheck);
 
+            // ‎فحص صلاحية العملة للأطراف المالية: الحساب المقابل يجب أن يدعم عملة السند.
+            var partyCheck = await FinancialPartyGuard.ValidateAsync(
+                _db, accountIds, req.Currency, ct);
+            if (partyCheck != null) return Result.Failure<int>(partyCheck);
+
             // ‎نفك الترحيل قبل تعديل البنود ثم نُرحّل من جديد فقط إذا طلب المستخدم.
             // ‎بهذه الطريقة يستطيع المستخدم تحويل قيد مُرحَّل إلى مسودة عبر إلغاء
             // ‎علامة "ترحيل فوري" وحفظ السند.
             if (entry.Status == JournalEntryStatus.Posted) entry.Unpost();
 
-            entry.UpdateBasic(req.EntryDate, req.Description, entry.EntryType, req.Currency, entry.VoucherTypeId, req.ManualNumber);
+            entry.UpdateBasic(req.EntryDate, req.Description, entry.EntryType, req.Currency, entry.VoucherTypeId, req.ManualNumber,
+                req.ManualExchangeRate, req.ManualExchangeRateOperation);
             entry.ReplaceLines(req.Lines.Select(l =>
                 (l.AccountId, l.IsDebit, l.Amount, l.Description)).ToList());
 
@@ -152,34 +163,6 @@ public class UpdateVoucherEntryHandler : IRequestHandler<UpdateVoucherEntryComma
         catch (UnbalancedJournalEntryException ex) { return Result.Failure<int>(ex.Message); }
         catch (DomainException ex) { return Result.Failure<int>(ex.Message); }
     }
-
-    private async Task<string?> EnsureCurrencyHasActiveBulletin(string currency, DateTime entryDate, CancellationToken ct)
-    {
-        var cur = (currency ?? "IQD").Trim().ToUpperInvariant();
-        var atUtc = (entryDate.Kind == DateTimeKind.Utc ? entryDate : entryDate.ToUniversalTime())
-            .Date.AddDays(1).AddTicks(-1);
-
-        var bulletin = await _db.CurrencyRateBulletins
-            .Include(b => b.Lines)
-            .Where(b => b.Status == CurrencyRateBulletinStatus.Published && b.EffectiveAt <= atUtc)
-            .OrderByDescending(b => b.EffectiveAt).ThenByDescending(b => b.Id)
-            .FirstOrDefaultAsync(ct);
-
-        if (bulletin != null && string.Equals(bulletin.BaseCurrency, cur, StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        if (bulletin == null)
-        {
-            if (cur == "IQD") return null;
-            return $"العملة {cur} غير مُسعَّرة في نشرة الأسعار — لا توجد نشرة منشورة سارية بتاريخ {entryDate:yyyy-MM-dd}.";
-        }
-
-        var hasLine = bulletin.Lines.Any(l => string.Equals(l.Currency, cur, StringComparison.OrdinalIgnoreCase));
-        if (!hasLine)
-            return $"العملة {cur} غير مُسعَّرة في نشرة الأسعار '{bulletin.Name}'.";
-
-        return null;
-    }
 }
 
 /// <summary>أمر حذف قيد سند مخصّص (يتجاوز قيد منع حذف القيود المُدارة في DeleteJournalEntryCommand).</summary>
@@ -189,8 +172,12 @@ public class DeleteVoucherEntryHandler : IRequestHandler<DeleteVoucherEntryComma
 {
     private readonly IAccountingDbContext _db;
     private readonly IAuditLogger _audit;
-    public DeleteVoucherEntryHandler(IAccountingDbContext db, IAuditLogger audit)
-    { _db = db; _audit = audit; }
+    private readonly IVoucherAttachmentDeletionService _attachmentDeletion;
+    public DeleteVoucherEntryHandler(
+        IAccountingDbContext db,
+        IAuditLogger audit,
+        IVoucherAttachmentDeletionService attachmentDeletion)
+    { _db = db; _audit = audit; _attachmentDeletion = attachmentDeletion; }
 
     public async Task<Result<bool>> Handle(DeleteVoucherEntryCommand req, CancellationToken ct)
     {
@@ -202,6 +189,8 @@ public class DeleteVoucherEntryHandler : IRequestHandler<DeleteVoucherEntryComma
         if (!entry.VoucherTypeId.HasValue)
             return Result.Failure<bool>("هذا القيد ليس سنداً — استخدم حذف القيد العادي");
 
+        var deletedAttachments = await _attachmentDeletion.DeleteAllForJournalEntryAsync(req.Id, ct);
+
         entry.MarkAsDeleted();
         foreach (var line in entry.Lines) line.MarkAsDeleted();
 
@@ -212,7 +201,7 @@ public class DeleteVoucherEntryHandler : IRequestHandler<DeleteVoucherEntryComma
             entityId: entry.Id.ToString(),
             action: AuditActions.Delete,
             summary: $"حذف سند رقم {entry.VoucherSequence ?? 0} — {entry.Description}",
-            details: new { entry.EntryNumber, entry.VoucherTypeId, entry.VoucherSequence, entry.TotalDebit, entry.TotalCredit },
+            details: new { entry.EntryNumber, entry.VoucherTypeId, entry.VoucherSequence, entry.TotalDebit, entry.TotalCredit, deletedAttachments },
             ct: ct);
 
         return Result.Success(true);

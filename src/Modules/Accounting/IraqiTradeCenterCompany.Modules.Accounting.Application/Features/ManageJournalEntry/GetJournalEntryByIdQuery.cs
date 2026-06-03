@@ -45,6 +45,8 @@ public class GetJournalEntryByIdHandler : IRequestHandler<GetJournalEntryByIdQue
                 ? $"{entry.VoucherType.Code}-{entry.VoucherSequence.Value}"
                 : null,
             ManualNumber = entry.ManualNumber,
+            ManualExchangeRate = entry.ManualExchangeRate,
+            ManualExchangeRateOperation = entry.ManualExchangeRateOperation,
             Source = entry.Source.ToString(),
             ReferenceType = entry.ReferenceType,
             ReferenceId = entry.ReferenceId,

@@ -1,4 +1,5 @@
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Dtos;
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using IraqiTradeCenterCompany.SharedKernel.Models;
@@ -97,10 +98,7 @@ public class GetJournalEntriesListHandler : IRequestHandler<GetJournalEntriesLis
                 };
             }
             var allowedIds = req.AllowedCashBoxIds.ToList();
-            var cbAccountIds = await _db.CashBoxes.AsNoTracking()
-                .Where(b => allowedIds.Contains(b.Id))
-                .Select(b => b.AccountId)
-                .ToListAsync(ct);
+            var cbAccountIds = await CashBoxPartySource.GetAccountIdsByPartyIdsAsync(_db, allowedIds, ct);
             q = q.Where(e => e.Lines.Any(l => cbAccountIds.Contains(l.AccountId)));
         }
 
@@ -137,6 +135,8 @@ public class GetJournalEntriesListHandler : IRequestHandler<GetJournalEntriesLis
                 ? $"{e.VoucherType.Code}-{e.VoucherSequence.Value}"
                 : null,
             ManualNumber = e.ManualNumber,
+            ManualExchangeRate = e.ManualExchangeRate,
+            ManualExchangeRateOperation = e.ManualExchangeRateOperation,
             Source = e.Source.ToString(),
             ReferenceType = e.ReferenceType,
             ReferenceId = e.ReferenceId,

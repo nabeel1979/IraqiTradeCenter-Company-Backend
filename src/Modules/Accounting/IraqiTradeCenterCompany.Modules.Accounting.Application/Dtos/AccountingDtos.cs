@@ -27,6 +27,25 @@ public class AccountDto
     /// كسر السلامة المرجعية. الحماية الأساسية تبقى في الـ Handlers على الخادم.
     /// </summary>
     public bool IsUsed { get; set; }
+    /// <summary>
+    /// هل الحساب محجوز للإدارة المالية (مرتبط بنوع طرف مالي)؟ في هذه الحالة
+    /// لا يُسمح بإضافة فروع له يدوياً من شجرة الحسابات — تتم إضافة الأطراف حصراً
+    /// من نافذة الإدارة المالية. الواجهة تحجب أيقونة "+" بناءً على هذا الحقل.
+    /// </summary>
+    public bool IsLockedForParties { get; set; }
+    /// <summary>
+    /// هل الحساب مُدار بالكامل من الإدارة المالية (نوع طرف أو طرف فردي)؟
+    /// يُحجب التعديل والحذف من شجرة الحسابات.
+    /// </summary>
+    public bool IsManagedByFinancialManagement { get; set; }
+    /// <summary>
+    /// هل الحساب مرتبط بإعدادات تسوية الحسابات (وسيط / أرباح / خسائر / خصم فرق العملة)؟
+    /// </summary>
+    public bool IsLinkedToAccountSettlement { get; set; }
+    /// <summary>
+    /// أدوار الارتباط: Transit, FxGain, FxLoss, FxDiscount — للعرض في الشجرة.
+    /// </summary>
+    public List<string> AccountSettlementRoles { get; set; } = new();
     public List<AccountDto> Children { get; set; } = new();
 }
 
@@ -76,6 +95,10 @@ public class JournalEntryDto
     /// قابل للبحث في صفحة القيود/السندات.
     /// </summary>
     public string? ManualNumber { get; set; }
+    /// <summary>سعر صرف يدوي محفوظ على القيد (NULL = استخدام سعر النشرة).</summary>
+    public decimal? ManualExchangeRate { get; set; }
+    /// <summary>عملية السعر اليدوي: 1=ضرب، 2=قسمة.</summary>
+    public int? ManualExchangeRateOperation { get; set; }
     /// <summary>مصدر القيد: Manual / SalesInvoice / PurchaseInvoice / Payment / Receipt / …</summary>
     public string Source { get; set; } = "Manual";
     /// <summary>المرجع المصدر (للقيود المولّدة من فواتير أو حركات أخرى)</summary>

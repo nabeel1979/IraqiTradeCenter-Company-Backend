@@ -255,14 +255,20 @@ public class FiscalYearsController : BaseApiController
     }
 
     /// <summary>
-    /// Mode: 1=WithProfitLoss، 2=BalanceSheetOnly، 3=AllAccounts
+    /// Mode (بُعد الحسابات): 1=BalanceSheetOnly، 2=WithProfitLoss
+    /// CurrencyMode (بُعد العملة): 1=PerCurrency (لكل عملة مستقلة)، 2=ConvertToBase (تحويل للعملة الأساسية)
+    /// OpeningVoucherTypeId: نوع السند الثنائي (Mixed) للقيد الافتتاحي (الافتراضي OV)
+    /// RollBulletin: تدوير نشرة الأسعار المعتمدة إلى السنة الجديدة
     /// </summary>
     public record RolloverBody(
         int SourceFiscalYearId,
         int TargetFiscalYearId,
         string? ProfitAccountCode,
         string? LossAccountCode,
-        int Mode = 1,
+        int Mode = 2,
+        int CurrencyMode = 1,
+        int? OpeningVoucherTypeId = null,
+        bool RollBulletin = true,
         bool PreviewOnly = false,
         DateTime? OpeningEntryDate = null
     );
@@ -273,13 +279,26 @@ public class FiscalYearsController : BaseApiController
         try
         {
             var by = User.Identity?.Name ?? "system";
+            // ترقيم الواجهة لبُعد الحسابات: 1=الميزانية فقط، 2=مع الربح/الخسارة، 3=كل الحسابات.
+            var mode = body.Mode switch
+            {
+                3 => RolloverMode.AllAccounts,
+                2 => RolloverMode.WithProfitLoss,
+                _ => RolloverMode.BalanceSheetOnly,
+            };
+            var currencyMode = body.CurrencyMode == 2
+                ? RolloverCurrencyMode.ConvertToBase
+                : RolloverCurrencyMode.PerCurrency;
             var dto = await Mediator.Send(new RolloverFiscalYearCommand(
                 SourceFiscalYearId: body.SourceFiscalYearId,
                 TargetFiscalYearId: body.TargetFiscalYearId,
                 PerformedBy: by,
                 ProfitAccountCode: body.ProfitAccountCode,
                 LossAccountCode: body.LossAccountCode,
-                Mode: (RolloverMode)body.Mode,
+                Mode: mode,
+                CurrencyMode: currencyMode,
+                OpeningVoucherTypeId: body.OpeningVoucherTypeId,
+                RollBulletin: body.RollBulletin,
                 PreviewOnly: body.PreviewOnly,
                 OpeningEntryDate: body.OpeningEntryDate));
             return Ok(new { success = true, data = dto, message = dto.Message });

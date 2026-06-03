@@ -1,4 +1,5 @@
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
+using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 
@@ -112,9 +113,11 @@ public class GetAccountUsageHandler : IRequestHandler<GetAccountUsageQuery, Acco
             .ToList();
 
         // ── الصناديق المرتبطة ─────────────────────────────────────────────
-        dto.CashBoxes = await _db.CashBoxes.AsNoTracking()
-            .Where(b => b.AccountId == account.Id)
-            .Select(b => new RelatedCashBox(b.Id, b.NameAr, b.Code))
+        dto.CashBoxes = await _db.FinancialParties.AsNoTracking()
+            .Include(p => p.Category)
+            .Include(p => p.Account)
+            .Where(p => p.AccountId == account.Id && p.Category!.Kind == FinancialPartyKind.CashBox)
+            .Select(p => new RelatedCashBox(p.Id, p.Account!.NameAr, p.Account.Code))
             .ToListAsync(ct);
 
         // ── أنواع السندات التي تستخدم الحساب كافتراضي ─────────────────────

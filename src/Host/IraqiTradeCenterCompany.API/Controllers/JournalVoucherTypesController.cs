@@ -21,9 +21,9 @@ public class JournalVoucherTypesController : BaseApiController
     }
 
     [HttpGet]
-    public async Task<IActionResult> GetAll([FromQuery] bool? enabledOnly = null)
+    public async Task<IActionResult> GetAll([FromQuery] bool? enabledOnly = null, [FromQuery] bool managementOnly = false)
     {
-        var data = await Mediator.Send(new GetJournalVoucherTypesQuery(enabledOnly));
+        var data = await Mediator.Send(new GetJournalVoucherTypesQuery(enabledOnly, managementOnly));
         return Ok(new { success = true, data });
     }
 

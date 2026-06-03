@@ -1,5 +1,7 @@
 using IraqiTradeCenterCompany.API.Auth;
 using IraqiTradeCenterCompany.API.Auth.Permissions;
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
+using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -13,11 +15,13 @@ public class UsersController : ControllerBase
 {
     private readonly AuthDbContext _db;
     private readonly IPermissionService _permissions;
+    private readonly IAccountingDbContext _accountingDb;
 
-    public UsersController(AuthDbContext db, IPermissionService permissions)
+    public UsersController(AuthDbContext db, IPermissionService permissions, IAccountingDbContext accountingDb)
     {
         _db = db;
         _permissions = permissions;
+        _accountingDb = accountingDb;
     }
 
     // ────────────────────────────────────────────────────────────
@@ -38,7 +42,8 @@ public class UsersController : ControllerBase
             .OrderBy(u => u.FullName)
             .Select(u => new
             {
-                u.Id, u.FullName, u.Phone, u.IsActive, u.CreatedAt,
+                u.Id, u.FullName, u.Phone, u.IsActive, u.MustChangePassword, u.CreatedAt,
+                hasAvatar = u.AvatarBase64 != null && u.AvatarBase64 != "",
                 roles = _db.UserRoles
                     .Where(ur => ur.UserId == u.Id)
                     .Join(_db.Roles, ur => ur.RoleId, r => r.Id, (ur, r) => r.NameAr)
@@ -80,7 +85,8 @@ public class UsersController : ControllerBase
             success = true,
             data = new
             {
-                user.Id, user.FullName, user.Phone, user.IsActive, user.CreatedAt,
+                user.Id, user.FullName, user.Phone, user.IsActive, user.MustChangePassword, user.CreatedAt,
+                avatarBase64 = user.AvatarBase64,
                 roleIds = roles,
                 overrides,
                 cashBoxes,
@@ -103,14 +109,24 @@ public class UsersController : ControllerBase
         if (await _db.Users.AnyAsync(u => u.Phone == dto.Phone, ct))
             return Conflict(new { success = false, errors = new[] { "رقم الهاتف مستخدم لمستخدم آخر" } });
 
+        string? avatar = null;
+        if (dto.AvatarBase64 != null)
+        {
+            avatar = NormalizeAvatar(dto.AvatarBase64, out var avErrCreate);
+            if (avErrCreate is not null)
+                return BadRequest(new { success = false, errors = new[] { avErrCreate } });
+        }
+
         var user = new CompanyUser
         {
             Id           = Guid.NewGuid(),
             FullName     = dto.FullName.Trim(),
             Phone        = dto.Phone.Trim(),
             PasswordHash = PasswordHelper.Hash(dto.Password),
-            Role         = "User", // legacy column؛ السلطة الحقيقية من الأدوار الجدد
+            Role         = "User",
             IsActive     = dto.IsActive ?? true,
+            MustChangePassword = dto.MustChangePassword == true,
+            AvatarBase64 = avatar,
             CreatedAt    = DateTime.UtcNow,
         };
         _db.Users.Add(user);
@@ -142,12 +158,50 @@ public class UsersController : ControllerBase
             user.Phone = phone;
         }
         if (!string.IsNullOrWhiteSpace(dto.Password))
+        {
             user.PasswordHash = PasswordHelper.Hash(dto.Password);
+            // عند تعيين كلمة مرور جديدة من الإدارة، يُلزم التغيير عند الدخول ما لم يُحدَّد خلاف ذلك
+            user.MustChangePassword = dto.MustChangePassword ?? true;
+        }
+        else if (dto.MustChangePassword.HasValue)
+            user.MustChangePassword = dto.MustChangePassword.Value;
         if (dto.IsActive.HasValue) user.IsActive = dto.IsActive.Value;
+        if (dto.AvatarBase64 != null)
+        {
+            var av = NormalizeAvatar(dto.AvatarBase64, out var avErr);
+            if (avErr is not null)
+                return BadRequest(new { success = false, errors = new[] { avErr } });
+            user.AvatarBase64 = av;
+        }
 
         await _db.SaveChangesAsync(ct);
         _permissions.InvalidateUser(id);
         return Ok(new { success = true });
+    }
+
+    /// <summary>يُولّد كلمة مرور عشوائية ويُلزم المستخدم بتغييرها عند الدخول التالي.</summary>
+    [HttpPost("{id:guid}/reset-password")]
+    [RequirePermission(PermissionRegistry.System.Users.Update)]
+    public async Task<IActionResult> ResetPassword(Guid id, CancellationToken ct)
+    {
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == id, ct);
+        if (user is null) return NotFound(new { success = false, errors = new[] { "المستخدم غير موجود" } });
+
+        var temporaryPassword = PasswordHelper.Generate();
+        user.PasswordHash = PasswordHelper.Hash(temporaryPassword);
+        user.MustChangePassword = true;
+        await _db.SaveChangesAsync(ct);
+        _permissions.InvalidateUser(id);
+
+        return Ok(new
+        {
+            success = true,
+            data = new
+            {
+                temporaryPassword,
+                mustChangePassword = true,
+            }
+        });
     }
 
     [HttpDelete("{id:guid}")]
@@ -235,10 +289,33 @@ public class UsersController : ControllerBase
         if (!await _db.Users.AnyAsync(u => u.Id == id, ct))
             return NotFound(new { success = false, errors = new[] { "المستخدم غير موجود" } });
 
+        var entries = dto.CashBoxes ?? Array.Empty<UserCashBoxEntryDto>();
+        if (entries.Count > 0)
+        {
+            var ids = entries.Select(c => c.CashBoxId).Distinct().ToList();
+            var validIds = await _accountingDb.FinancialParties.AsNoTracking()
+                .Include(p => p.Category)
+                .Where(p => ids.Contains(p.Id)
+                            && p.Category!.Kind == FinancialPartyKind.CashBox
+                            && p.IsActive
+                            && !p.IsDeleted)
+                .Select(p => p.Id)
+                .ToListAsync(ct);
+            var invalid = ids.Except(validIds).ToList();
+            if (invalid.Count > 0)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    errors = new[] { $"معرّفات صناديق غير صالحة أو غير نشطة: {string.Join(", ", invalid)} — أنشئ الصناديق من الإدارة المالية." }
+                });
+            }
+        }
+
         var current = await _db.UserCashBoxes.Where(c => c.UserId == id).ToListAsync(ct);
         _db.UserCashBoxes.RemoveRange(current);
 
-        foreach (var c in dto.CashBoxes ?? Array.Empty<UserCashBoxEntryDto>())
+        foreach (var c in entries)
         {
             _db.UserCashBoxes.Add(new UserCashBox
             {
@@ -279,7 +356,8 @@ public class UsersController : ControllerBase
             success = true,
             data = new
             {
-                user.Id, user.FullName, user.Phone, user.IsActive,
+                user.Id, user.FullName, user.Phone, user.IsActive, user.MustChangePassword,
+                avatarBase64 = user.AvatarBase64,
                 roles,
                 permissions  = perms.ToArray(),
                 cashBoxIds   = cbIds.ToArray(),
@@ -294,10 +372,27 @@ public class UsersController : ControllerBase
                  ?? User.FindFirst("sub")?.Value;
         return Guid.TryParse(idStr, out var g) ? g : Guid.Empty;
     }
+
+    private const int MaxAvatarBase64Length = 700_000;
+
+    /// <summary>فارغ = حذف الصورة، null = لا تغيير.</summary>
+    private static string? NormalizeAvatar(string? raw, out string? error)
+    {
+        error = null;
+        if (raw is null) return null;
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var trimmed = raw.Trim();
+        if (trimmed.Length > MaxAvatarBase64Length)
+        {
+            error = "حجم صورة المستخدم كبير جداً — استخدم صورة أصغر من 500 ك.ب تقريباً";
+            return null;
+        }
+        return trimmed;
+    }
 }
 
-public record UserCreateDto(string FullName, string Phone, string Password, bool? IsActive, IList<int>? RoleIds);
-public record UserUpdateDto(string? FullName, string? Phone, string? Password, bool? IsActive);
+public record UserCreateDto(string FullName, string Phone, string Password, bool? IsActive, IList<int>? RoleIds, bool? MustChangePassword, string? AvatarBase64);
+public record UserUpdateDto(string? FullName, string? Phone, string? Password, bool? IsActive, bool? MustChangePassword, string? AvatarBase64);
 public record SetRolesDto(IList<int>? RoleIds);
 public record OverrideEntryDto(string PermissionCode, bool IsGranted);
 public record SetOverridesDto(IList<OverrideEntryDto>? Overrides);

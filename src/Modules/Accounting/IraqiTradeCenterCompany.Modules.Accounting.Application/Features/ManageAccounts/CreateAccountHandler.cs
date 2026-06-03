@@ -1,3 +1,4 @@
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Entities;
 using IraqiTradeCenterCompany.SharedKernel.Exceptions;
@@ -70,11 +71,18 @@ public class CreateAccountHandler : IRequestHandler<CreateAccountCommand, Result
                 // ‎إذا كان الأب ورقة (Leaf) ومستخدم فعلاً (قيود/صناديق/أنواع سندات/رصيد
                 // ‎افتتاحي) — لا نسمح بإضافة فروع تحته، لأن إضافة فرع تحوّله إلى أب
                 // ‎(non-leaf) فيكسر القيود/المراجع التي تشير إليه كحساب تفصيلي.
+                if (parent.IsLockedForParties)
+                    return Result.Failure<int>(
+                        "هذا الحساب محجوز للإدارة المالية — أضف الأطراف من نافذة الموردين/العملاء/المصارف");
+
+                if (await FinancialManagementAccountGuard.IsManagedAccountAsync(_db, parent.Id, ct))
+                    return Result.Failure<int>(FinancialManagementAccountGuard.ManagedParentMessage);
+
                 if (parent.IsLeaf)
                 {
                     var pid = parent.Id;
                     var inUse = await _db.JournalEntryLines.AnyAsync(l => l.AccountId == pid, ct)
-                        || await _db.CashBoxes.AnyAsync(b => b.AccountId == pid, ct)
+                        || await CashBoxPartySource.IsCashBoxAccountAsync(_db, pid, ct)
                         || await _db.JournalVoucherTypes.AnyAsync(
                             v => v.DefaultDebitAccountId == pid || v.DefaultCreditAccountId == pid, ct)
                         || parent.OpeningBalance != 0;

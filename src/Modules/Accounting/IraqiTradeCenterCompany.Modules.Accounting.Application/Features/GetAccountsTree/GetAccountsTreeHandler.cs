@@ -1,6 +1,8 @@
 using AutoMapper;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Dtos;
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
+using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 
@@ -27,8 +29,12 @@ public class GetAccountsTreeHandler : IRequestHandler<GetAccountsTreeQuery, List
         // ‎أرصدة افتتاحية — في مجموعة واحدة (Set من Ids) ثم نُعلّم الـ DTOs.
         var usedInLines = await _db.JournalEntryLines.AsNoTracking()
             .Select(l => l.AccountId).Distinct().ToListAsync(ct);
-        var usedInCashBoxes = await _db.CashBoxes.AsNoTracking()
-            .Select(b => b.AccountId).Distinct().ToListAsync(ct);
+        var usedInCashBoxes = await _db.FinancialParties.AsNoTracking()
+            .Include(p => p.Category)
+            .Where(p => p.Category!.Kind == FinancialPartyKind.CashBox)
+            .Select(p => p.AccountId)
+            .Distinct()
+            .ToListAsync(ct);
         var usedInVoucherDebit = await _db.JournalVoucherTypes.AsNoTracking()
             .Where(v => v.DefaultDebitAccountId.HasValue)
             .Select(v => v.DefaultDebitAccountId!.Value).Distinct().ToListAsync(ct);
@@ -44,8 +50,25 @@ public class GetAccountsTreeHandler : IRequestHandler<GetAccountsTreeQuery, List
         foreach (var a in all.Where(a => a.OpeningBalance != 0))
             usedIds.Add(a.Id);
 
+        var fmPartyAccountIds = await _db.FinancialParties.AsNoTracking()
+            .Select(p => p.AccountId)
+            .ToListAsync(ct);
+        var fmPartySet = fmPartyAccountIds.ToHashSet();
+
+        var settlementSettings = await AccountSettlementLinkedSource.GetSettingsAsync(_db, ct);
+        var settlementRoleMap = AccountSettlementLinkedSource.BuildRoleMap(settlementSettings);
+
         foreach (var d in dtos)
+        {
             d.IsUsed = usedIds.Contains(d.Id);
+            d.IsManagedByFinancialManagement = d.IsLockedForParties || fmPartySet.Contains(d.Id);
+            if (settlementRoleMap.TryGetValue(d.Id, out var roles))
+            {
+                d.IsLinkedToAccountSettlement = true;
+                d.AccountSettlementRoles = roles;
+                d.IsUsed = true;
+            }
+        }
 
         var lookup = dtos.ToDictionary(a => a.Id);
         var roots = new List<AccountDto>();

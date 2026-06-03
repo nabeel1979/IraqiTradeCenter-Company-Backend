@@ -26,6 +26,19 @@ public enum RolloverMode
 }
 
 /// <summary>
+/// بُعد العملة عند التدوير:
+///   • <c>PerCurrency</c>: يُنشأ قيد افتتاحي مستقل لكل عملة بأرصدتها الأصلية
+///     (دون تحويل) — يحافظ على الدقة التامة لأرصدة كل عملة.
+///   • <c>ConvertToBase</c>: تُحوَّل كل العملات إلى العملة الأساسية وفق أحدث
+///     نشرة منشورة، ويُنشأ قيد افتتاحي واحد بالعملة الأساسية.
+/// </summary>
+public enum RolloverCurrencyMode
+{
+    PerCurrency = 1,
+    ConvertToBase = 2,
+}
+
+/// <summary>
 /// أمر تدوير الأرصدة من سنة مالية مغلقة إلى سنة مالية لاحقة.
 /// شروط:
 ///   • السنة المصدر يجب أن تكون مغلقة (يضمن ثبات الأرصدة).
@@ -39,6 +52,9 @@ public record RolloverFiscalYearCommand(
     string? ProfitAccountCode,
     string? LossAccountCode,
     RolloverMode Mode = RolloverMode.WithProfitLoss,
+    RolloverCurrencyMode CurrencyMode = RolloverCurrencyMode.PerCurrency,
+    int? OpeningVoucherTypeId = null,
+    bool RollBulletin = true,
     bool PreviewOnly = false,
     DateTime? OpeningEntryDate = null
 ) : IRequest<FiscalYearRolloverResultDto>;
@@ -47,6 +63,8 @@ public class RolloverFiscalYearHandler : IRequestHandler<RolloverFiscalYearComma
 {
     private readonly IAccountingDbContext _db;
     public RolloverFiscalYearHandler(IAccountingDbContext db) => _db = db;
+
+    private const string OpeningLineDesc = "رصيد افتتاحي مُدوَّر";
 
     public async Task<FiscalYearRolloverResultDto> Handle(RolloverFiscalYearCommand req, CancellationToken ct)
     {
@@ -86,95 +104,168 @@ public class RolloverFiscalYearHandler : IRequestHandler<RolloverFiscalYearComma
             .FirstOrDefault(p => p.StartDate.Date <= openingDate && p.EndDate.Date >= openingDate)
             ?? throw new DomainException("لا توجد فترة محاسبية تغطي تاريخ القيد الافتتاحي في السنة الهدف");
 
-        // ─── 3) جمع أرصدة الحسابات الورقية (Leaf) من السنة المصدر ────────────
-        // ‎الرصيد = OpeningBalance + Σ(Posted Debit - Posted Credit) خلال السنة المصدر.
-        // ‎نستخدم join يدوي لأن JournalEntryLine ليس لديه navigation إلى JournalEntry.
-        var srcEntryAggregates = await (
+        // ─── 3) جمع أرصدة الحسابات الورقية من السنة المصدر مجمّعة حسب (حساب، عملة) ──
+        // ‎الرصيد لكل (حساب، عملة) = Σ(Posted Debit - Posted Credit) خلال السنة المصدر.
+        // ‎عملة السطر تساوي عملة قيده (لكل قيد عملة واحدة)، فالتجميع على e.Currency دقيق.
+        var srcAgg = await (
             from l in _db.JournalEntryLines.AsNoTracking()
             join e in _db.JournalEntries.AsNoTracking() on l.JournalEntryId equals e.Id
             where e.FiscalYearId == src.Id && e.Status == JournalEntryStatus.Posted
-            group l by l.AccountId into g
+            group new { l.IsDebit, l.Amount } by new { l.AccountId, e.Currency } into g
             select new
             {
-                AccountId = g.Key,
+                g.Key.AccountId,
+                g.Key.Currency,
                 Debit = g.Where(x => x.IsDebit).Sum(x => (decimal?)x.Amount) ?? 0m,
                 Credit = g.Where(x => !x.IsDebit).Sum(x => (decimal?)x.Amount) ?? 0m,
             }).ToListAsync(ct);
 
-        var aggDict = srcEntryAggregates.ToDictionary(a => a.AccountId);
-
-        var allAccounts = await _db.Accounts.AsNoTracking()
+        var accounts = await _db.Accounts.AsNoTracking()
             .Where(a => a.IsActive && a.IsLeaf)
             .ToListAsync(ct);
+        var accById = accounts.ToDictionary(a => a.Id);
 
-        // ‎صافي الرصيد لكل حساب (Debit - Credit) — موجب يعني رصيد مدين.
-        var balances = new List<(Account Account, decimal Net)>();
-        foreach (var acc in allAccounts)
+        // ‎العملة الأساسية ونشرة التحويل (تُستخدم في وضع ConvertToBase فقط).
+        var asOf = openingDate.AddDays(1).AddTicks(-1);
+        var convBulletin = await _db.CurrencyRateBulletins.AsNoTracking()
+            .Include(b => b.Lines)
+            .Where(b => b.Status == CurrencyRateBulletinStatus.Published && b.EffectiveAt <= asOf)
+            .OrderByDescending(b => b.EffectiveAt).ThenByDescending(b => b.Id)
+            .FirstOrDefaultAsync(ct);
+        var baseCur = (convBulletin?.BaseCurrency ?? "IQD").Trim().ToUpperInvariant();
+        var rates = new Dictionary<string, (decimal Rate, int Operation)>(StringComparer.OrdinalIgnoreCase);
+        if (convBulletin != null)
+            foreach (var line in convBulletin.Lines.Where(l => l.Rate > 0 && !string.IsNullOrWhiteSpace(l.Currency)))
+                rates[line.Currency.Trim().ToUpperInvariant()] = (line.Rate, (int)line.Operation);
+
+        // ‎صافي كل (عملة → (حساب → رصيد)). الرصيد موجب = مدين.
+        var netByCurrency = new Dictionary<string, Dictionary<int, decimal>>(StringComparer.OrdinalIgnoreCase);
+        void AddNet(string cur, int accId, decimal net)
         {
-            var openingNet = acc.Nature == AccountNature.Debit
-                ? acc.OpeningBalance
-                : -acc.OpeningBalance;
-            var movement = aggDict.TryGetValue(acc.Id, out var a)
-                ? a.Debit - a.Credit
-                : 0m;
-            var net = openingNet + movement;
-            if (Math.Round(net, 3) == 0m) continue;
-            balances.Add((acc, net));
+            cur = string.IsNullOrWhiteSpace(cur) ? baseCur : cur.Trim().ToUpperInvariant();
+            if (!netByCurrency.TryGetValue(cur, out var map))
+                netByCurrency[cur] = map = new Dictionary<int, decimal>();
+            map[accId] = (map.TryGetValue(accId, out var prev) ? prev : 0m) + net;
         }
 
-        // ─── 4) فصل أرصدة الحسابات حسب النوع ─────────────────────────────────
-        var bsBalances = balances
-            .Where(b => b.Account.Type == AccountType.Asset
-                     || b.Account.Type == AccountType.Liability
-                     || b.Account.Type == AccountType.Equity)
-            .ToList();
-
-        var pnlBalances = balances
-            .Where(b => b.Account.Type == AccountType.Revenue
-                     || b.Account.Type == AccountType.Expense)
-            .ToList();
-
-        // ‎صافي الربح/الخسارة = إجمالي الإيرادات - إجمالي المصروفات.
-        decimal totalRevenue = -pnlBalances.Where(b => b.Account.Type == AccountType.Revenue).Sum(b => b.Net);
-        decimal totalExpense = pnlBalances.Where(b => b.Account.Type == AccountType.Expense).Sum(b => b.Net);
-        decimal netProfit = totalRevenue - totalExpense; // ‎موجب=ربح، سالب=خسارة
-
-        // ‎الحسابات التي ستظهر في القيد الافتتاحي حسب النمط:
-        var rollingBalances = req.Mode switch
+        foreach (var row in srcAgg)
         {
-            RolloverMode.AllAccounts => balances,                       // ‎كل الحسابات (4 أنواع)
-            RolloverMode.WithProfitLoss => bsBalances,                  // ‎الميزانية فقط + سطر الربح/الخسارة
-            RolloverMode.BalanceSheetOnly => bsBalances,                // ‎الميزانية فقط
-            _ => bsBalances,
+            if (!accById.ContainsKey(row.AccountId)) continue;
+            AddNet(row.Currency, row.AccountId, row.Debit - row.Credit);
+        }
+
+        // ‎البذرة الأولى: إن لم يكن للسنة المصدر قيد افتتاحي (سنة أولى أُدخلت أرصدتها
+        // ‎في OpeningBalance يدوياً) نضمّ OpeningBalance للعملة الأساسية. أما إذا كان
+        // ‎لها قيد افتتاحي فأرصدتها مشمولة في الحركة أعلاه (لتفادي الازدواج).
+        var srcHasOpening = await _db.JournalEntries.AsNoTracking()
+            .AnyAsync(e => e.FiscalYearId == src.Id && e.EntryType == JournalEntryType.Opening, ct);
+        if (!srcHasOpening)
+        {
+            foreach (var acc in accounts.Where(a => a.OpeningBalance != 0m))
+            {
+                var net = acc.Nature == AccountNature.Debit ? acc.OpeningBalance : -acc.OpeningBalance;
+                AddNet(baseCur, acc.Id, net);
+            }
+        }
+
+        // ─── 4) في وضع ConvertToBase: دمج كل العملات في العملة الأساسية ───────
+        decimal MultiplierToBase(string cur)
+        {
+            var c = cur.Trim().ToUpperInvariant();
+            if (c == baseCur) return 1m;
+            if (rates.TryGetValue(c, out var r) && r.Rate > 0m)
+                return r.Operation == 2 ? 1m / r.Rate : r.Rate;
+            throw new DomainException(
+                $"تعذّر التحويل: العملة {c} غير مُسعَّرة في نشرة منشورة سارية. " +
+                "استخدم وضع 'قيد افتتاحي لكل عملة'، أو انشر نشرة أسعار تتضمّن هذه العملة.");
+        }
+
+        // قائمة السلال المراد إنشاء قيد لكل منها: (العملة، الحساب → الرصيد).
+        List<(string Currency, Dictionary<int, decimal> Nets)> buckets;
+        if (req.CurrencyMode == RolloverCurrencyMode.ConvertToBase)
+        {
+            var baseNets = new Dictionary<int, decimal>();
+            foreach (var (cur, nets) in netByCurrency)
+            {
+                var mult = MultiplierToBase(cur);
+                foreach (var kv in nets)
+                    baseNets[kv.Key] = (baseNets.TryGetValue(kv.Key, out var prev) ? prev : 0m) + kv.Value * mult;
+            }
+            buckets = new() { (baseCur, baseNets) };
+        }
+        else
+        {
+            buckets = netByCurrency
+                .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => (kv.Key, kv.Value))
+                .ToList();
+        }
+
+        // ─── 5) تصنيف رصيد سلّة (ميزانية / إيرادات-مصاريف) وحساب صافي الربح ────
+        (List<(int Id, decimal Net)> Bs, List<(int Id, AccountType Type, decimal Net)> Pnl, decimal NetProfit)
+            Classify(Dictionary<int, decimal> nets)
+        {
+            var bs = new List<(int, decimal)>();
+            var pnl = new List<(int, AccountType, decimal)>();
+            foreach (var kv in nets)
+            {
+                if (!accById.TryGetValue(kv.Key, out var a)) continue;
+                var net = Math.Round(kv.Value, 3);
+                if (net == 0m) continue;
+                if (a.Type is AccountType.Asset or AccountType.Liability or AccountType.Equity)
+                    bs.Add((a.Id, net));
+                else
+                    pnl.Add((a.Id, a.Type, net));
+            }
+            decimal totalRevenue = -pnl.Where(p => p.Item2 == AccountType.Revenue).Sum(p => p.Item3);
+            decimal totalExpense = pnl.Where(p => p.Item2 == AccountType.Expense).Sum(p => p.Item3);
+            return (bs, pnl, totalRevenue - totalExpense);
+        }
+
+        bool BucketHasContent(List<(int Id, decimal Net)> bs, List<(int Id, AccountType Type, decimal Net)> pnl, decimal netProfit)
+            => req.Mode switch
+            {
+                RolloverMode.AllAccounts => bs.Count + pnl.Count > 0,
+                RolloverMode.WithProfitLoss => bs.Count > 0 || Math.Round(netProfit, 3) != 0m,
+                _ => bs.Count > 0,
+            };
+
+        string ModeLabel() => req.Mode switch
+        {
+            RolloverMode.WithProfitLoss => "مع إقفال الأرباح/الخسائر",
+            RolloverMode.AllAccounts => "ترحيل كامل (شامل الإيرادات والمصاريف)",
+            _ => "أرصدة الميزانية فقط",
         };
 
-        // ─── 5) في وضع المعاينة فقط — أرجع النتيجة بدون تعديل ─────────────────
+        // ─── 6) المعاينة: عدّ القيود والحسابات دون أي تعديل ──────────────────
         if (req.PreviewOnly)
         {
-            var msg = req.Mode switch
+            int prevEntries = 0, prevBs = 0;
+            decimal prevProfit = 0m;
+            foreach (var (cur, nets) in buckets)
             {
-                RolloverMode.WithProfitLoss =>
-                    $"معاينة: سيتم تدوير {bsBalances.Count} حساب ميزانية + ترحيل صافي {(netProfit >= 0 ? "ربح" : "خسارة")} = {Math.Abs(netProfit):N3}",
-                RolloverMode.AllAccounts =>
-                    $"معاينة: سيتم تدوير {balances.Count} حساب (ميزانية + إيرادات + مصاريف) كرصيد افتتاحي",
-                _ =>
-                    $"معاينة: سيتم تدوير {bsBalances.Count} حساب ميزانية بدون احتساب ربح/خسارة",
-            };
+                var (bs, pnl, netProfit) = Classify(nets);
+                if (!BucketHasContent(bs, pnl, netProfit)) continue;
+                prevEntries++;
+                prevBs += bs.Count;
+                prevProfit += netProfit;
+            }
+            var curLabel = req.CurrencyMode == RolloverCurrencyMode.PerCurrency
+                ? $"{prevEntries} قيد افتتاحي (قيد لكل عملة)"
+                : $"قيد افتتاحي واحد بالعملة الأساسية {baseCur}";
             return new FiscalYearRolloverResultDto
             {
                 Success = true,
                 FromFiscalYearId = src.Id,
                 ToFiscalYearId = dst.Id,
-                BalanceSheetAccountsRolled = rollingBalances.Count,
-                RetainedEarningsTransferred = req.Mode == RolloverMode.WithProfitLoss ? netProfit : 0m,
-                Message = msg,
+                BalanceSheetAccountsRolled = prevBs,
+                RetainedEarningsTransferred = req.Mode == RolloverMode.WithProfitLoss ? prevProfit : 0m,
+                OpeningEntriesCreated = prevEntries,
+                Message = $"معاينة: سيتم إنشاء {curLabel} — نمط: {ModeLabel()}.",
             };
         }
 
-        // ─── 6) تنفيذ التدوير ضمن معاملة ─────────────────────────────────────
-        await using var trx = await _db.BeginTransactionAsync(ct);
-
-        // ‎جلب حسابات الربح/الخسارة (للوضع WithProfitLoss فقط).
+        // ─── 7) جلب حسابات الربح/الخسارة (لوضع WithProfitLoss) ────────────────
         Account? profitAcc = null, lossAcc = null;
         if (req.Mode == RolloverMode.WithProfitLoss)
         {
@@ -191,105 +282,151 @@ public class RolloverFiscalYearHandler : IRequestHandler<RolloverFiscalYearComma
                 ?? throw new DomainException($"حساب الخسائر بالكود {req.LossAccountCode} غير موجود أو غير نشط أو ليس ورقياً");
         }
 
-        // ‎بناء سطور القيد الافتتاحي.
-        var lines = new List<(int AccountId, bool IsDebit, decimal Amount, string? Description)>();
-        decimal totalDebit = 0m, totalCredit = 0m;
-        foreach (var (acc, net) in rollingBalances)
+        // ‎نوع السند الافتتاحي (اختياري): يُستخدم فقط إن اختاره المستخدم صراحةً.
+        // ‎لا يوجد إسناد تلقائي لأي نوع سند: تركه فارغاً يجعل القيد الافتتاحي قيداً
+        // ‎يدوياً عادياً قابلاً للتعديل بالكامل من نافذة القيود اليومية — تماماً كأي
+        // ‎قيد افتتاحي يُدخله المستخدم بنفسه.
+        // ‎وعند اختيار نوع سند، يجب أن يكون من النوع المختلط (Mixed) لأن القيد
+        // ‎الافتتاحي قيد متعدد البنود (مدين/دائن) — والأنواع غير المختلطة تُمنع من
+        // ‎التعديل في نافذة القيود اليومية فيصبح القيد غير قابل للتحرير.
+        JournalVoucherType? openingVt = null;
+        if (req.OpeningVoucherTypeId.HasValue)
         {
-            if (net > 0m)
-            {
-                lines.Add((acc.Id, true, net, "رصيد افتتاحي مُدوَّر"));
-                totalDebit += net;
-            }
-            else
-            {
-                lines.Add((acc.Id, false, -net, "رصيد افتتاحي مُدوَّر"));
-                totalCredit += -net;
-            }
+            openingVt = await _db.JournalVoucherTypes
+                .FirstOrDefaultAsync(v => v.Id == req.OpeningVoucherTypeId.Value, ct)
+                ?? throw new DomainException("نوع السند الافتتاحي المختار غير موجود");
+            if (!openingVt.IsEnabled)
+                throw new DomainException($"نوع السند الافتتاحي '{openingVt.NameAr}' معطّل");
+            if (openingVt.Nature != VoucherNature.Mixed)
+                throw new DomainException(
+                    $"نوع السند الافتتاحي '{openingVt.NameAr}' ليس من النوع المختلط (Mixed). " +
+                    "اختر نوع سند مختلطاً ليبقى القيد الافتتاحي قابلاً للتعديل، أو اتركه فارغاً.");
         }
 
-        // ‎في وضع With Profit/Loss: نُضيف سطر الربح/الخسارة ليُعدّل التوازن.
-        if (req.Mode == RolloverMode.WithProfitLoss && Math.Round(netProfit, 3) != 0m)
+        // ─── 8) تنفيذ التدوير ضمن معاملة ─────────────────────────────────────
+        await using var trx = await _db.BeginTransactionAsync(ct);
+
+        int entriesCreated = 0, bsRolled = 0;
+        decimal retained = 0m;
+
+        foreach (var (cur, nets) in buckets)
         {
-            if (netProfit > 0m)
+            var (bs, pnl, netProfit) = Classify(nets);
+            if (!BucketHasContent(bs, pnl, netProfit)) continue;
+
+            var rolling = req.Mode == RolloverMode.AllAccounts
+                ? bs.Concat(pnl.Select(p => (p.Id, p.Net))).ToList()
+                : bs;
+
+            var lines = new List<(int AccountId, bool IsDebit, decimal Amount, string? Description)>();
+            decimal totalDebit = 0m, totalCredit = 0m;
+            foreach (var (accId, net) in rolling)
             {
-                lines.Add((profitAcc!.Id, false, netProfit, "صافي الربح المرحَّل من السنة السابقة"));
-                totalCredit += netProfit;
+                if (net > 0m) { lines.Add((accId, true, net, OpeningLineDesc)); totalDebit += net; }
+                else { lines.Add((accId, false, -net, OpeningLineDesc)); totalCredit += -net; }
             }
-            else
+
+            if (req.Mode == RolloverMode.WithProfitLoss && Math.Round(netProfit, 3) != 0m)
             {
-                lines.Add((lossAcc!.Id, true, -netProfit, "صافي الخسارة المرحَّلة من السنة السابقة"));
-                totalDebit += -netProfit;
+                if (netProfit > 0m)
+                {
+                    lines.Add((profitAcc!.Id, false, netProfit, "صافي الربح المرحَّل من السنة السابقة"));
+                    totalCredit += netProfit;
+                }
+                else
+                {
+                    lines.Add((lossAcc!.Id, true, -netProfit, "صافي الخسارة المرحَّلة من السنة السابقة"));
+                    totalDebit += -netProfit;
+                }
             }
+
+            if (lines.Count == 0) continue;
+
+            if (Math.Round(totalDebit - totalCredit, 3) != 0m)
+                throw new DomainException(
+                    $"القيد الافتتاحي للعملة {cur} غير متوازن. مدين={totalDebit:N3}، دائن={totalCredit:N3}، " +
+                    $"فرق={(totalDebit - totalCredit):N3}. في وضع 'الميزانية فقط' قد تحتاج تضمين الأرباح/الخسائر.");
+
+            var entryNum = await _db.GetNextJournalEntryNumberAsync(dst.Id, ct);
+            int? voucherSeq = openingVt != null
+                ? await _db.GetNextVoucherSequenceAsync(openingVt.Id, dst.Id, ct)
+                : null;
+
+            var entry = JournalEntry.Create(
+                date: openingDate,
+                fyId: dst.Id,
+                periodId: firstPeriod.Id,
+                source: JournalEntrySource.Manual,
+                description: $"قيد افتتاحي مُدوَّر من {src.Name} [{cur}] ({ModeLabel()})",
+                type: JournalEntryType.Opening,
+                currency: cur,
+                entryNumber: entryNum.ToString(),
+                voucherTypeId: openingVt?.Id,
+                voucherSequence: voucherSeq);
+
+            entry.ReplaceLines(lines);
+            // ‎قيد افتتاحي كمسودة — يُراجع ويُعدَّل ويُرحَّل يدوياً مثل أي قيد يُنشأ من الواجهة.
+            await _db.JournalEntries.AddAsync(entry, ct);
+
+            entriesCreated++;
+            bsRolled += bs.Count;
+            retained += netProfit;
         }
 
-        // ‎موازنة احتمالات الـ rounding (في الميزان الأصلي هناك توازن أصلاً، لكن
-        // ‎عمليات Math.Round قد تنتج فروق مليمات). نرفض القيد إن كان غير متوازن.
-        if (Math.Round(totalDebit - totalCredit, 3) != 0m)
-            throw new DomainException(
-                $"القيد الافتتاحي غير متوازن. مدين={totalDebit:N3}، دائن={totalCredit:N3}، فرق={(totalDebit - totalCredit):N3}. " +
-                "تحقّق من اكتمال إغلاق السنة السابقة.");
+        if (entriesCreated == 0)
+            throw new DomainException("لا توجد أرصدة قابلة للتدوير إلى السنة الهدف");
 
-        if (lines.Count == 0)
-            throw new DomainException("لا توجد أرصدة ميزانية للتدوير");
-
-        // ‎إنشاء القيد الافتتاحي.
-        var modeLabel = req.Mode switch
+        // ─── 9) تدوير نشرة الأسعار المعتمدة إلى السنة الجديدة (اختياري) ───────
+        int? rolledBulletinId = null;
+        if (req.RollBulletin)
         {
-            RolloverMode.WithProfitLoss => "مع إقفال الأرباح/الخسائر",
-            RolloverMode.AllAccounts => "ترحيل كامل (شامل الإيرادات والمصاريف)",
-            _ => "بدون تغيير",
-        };
+            var srcAsOf = src.EndDate.Date.AddDays(1).AddTicks(-1);
+            var srcBulletin = await _db.CurrencyRateBulletins.AsNoTracking()
+                .Include(b => b.Lines)
+                .Where(b => b.Status == CurrencyRateBulletinStatus.Published && b.EffectiveAt <= srcAsOf)
+                .OrderByDescending(b => b.EffectiveAt).ThenByDescending(b => b.Id)
+                .FirstOrDefaultAsync(ct);
 
-        var entryNum = await _db.GetNextJournalEntryNumberAsync(dst.Id, ct);
-        var entry = JournalEntry.Create(
-            date: openingDate,
-            fyId: dst.Id,
-            periodId: firstPeriod.Id,
-            source: JournalEntrySource.Manual,
-            description: $"قيد افتتاحي مُدوَّر من {src.Name} ({modeLabel})",
-            type: JournalEntryType.Opening,
-            currency: "IQD",
-            entryNumber: entryNum.ToString());
+            // لا نُكرّر التدوير إن وُجدت نشرة منشورة سارية بالفعل عند بداية السنة الهدف.
+            var alreadyHasBulletin = await _db.CurrencyRateBulletins.AsNoTracking()
+                .AnyAsync(b => b.Status == CurrencyRateBulletinStatus.Published
+                            && b.EffectiveAt <= asOf
+                            && b.EffectiveAt >= dst.StartDate.Date, ct);
 
-        entry.ReplaceLines(lines);
-        entry.Post(req.PerformedBy ?? "system");
-        await _db.JournalEntries.AddAsync(entry, ct);
-
-        // ‎تحديث OpeningBalance لكل حساب مُدوَّر (الميزانية + الإيرادات/المصاريف
-        // ‎في وضع AllAccounts).
-        var rolledAccountIds = rollingBalances.Select(b => b.Account.Id).ToList();
-        var trackedAccounts = await _db.Accounts
-            .Where(a => rolledAccountIds.Contains(a.Id))
-            .ToListAsync(ct);
-        foreach (var ta in trackedAccounts)
-        {
-            var net = rollingBalances.First(b => b.Account.Id == ta.Id).Net;
-            var stored = ta.Nature == AccountNature.Debit ? net : -net;
-            ta.SetOpeningBalance(stored);
+            if (srcBulletin != null && srcBulletin.Lines.Count > 0 && !alreadyHasBulletin)
+            {
+                var clone = CurrencyRateBulletin.Create(
+                    name: $"نشرة مُدوَّرة — {dst.Name}",
+                    baseCurrency: srcBulletin.BaseCurrency,
+                    effectiveAt: dst.StartDate.Date,
+                    notes: $"مُدوَّرة تلقائياً من نشرة '{srcBulletin.Name}' عند تدوير {src.Name} ⇒ {dst.Name}");
+                foreach (var line in srcBulletin.Lines)
+                    clone.AddLine(line.Currency, line.Rate, line.Operation, line.Notes);
+                clone.Publish(req.PerformedBy);
+                await _db.CurrencyRateBulletins.AddAsync(clone, ct);
+                await _db.SaveChangesAsync(ct);
+                rolledBulletinId = clone.Id;
+            }
         }
 
         await _db.SaveChangesAsync(ct);
         await trx.CommitAsync(ct);
 
-        var resultMsg = req.Mode switch
-        {
-            RolloverMode.WithProfitLoss =>
-                $"تم تدوير {bsBalances.Count} حساب ميزانية وترحيل صافي {(netProfit >= 0 ? "ربح" : "خسارة")} = {Math.Abs(netProfit):N3}",
-            RolloverMode.AllAccounts =>
-                $"تم تدوير {rollingBalances.Count} حساب (ميزانية + إيرادات + مصاريف) كرصيد افتتاحي",
-            _ =>
-                $"تم تدوير {bsBalances.Count} حساب ميزانية بدون احتساب ربح/خسارة",
-        };
+        var currencyNote = req.CurrencyMode == RolloverCurrencyMode.PerCurrency
+            ? $"{entriesCreated} قيد افتتاحي (قيد لكل عملة)"
+            : $"قيد افتتاحي واحد بالعملة الأساسية {baseCur}";
+        var bulletinNote = rolledBulletinId.HasValue ? " وتم تدوير نشرة الأسعار." : "";
 
         return new FiscalYearRolloverResultDto
         {
             Success = true,
             FromFiscalYearId = src.Id,
             ToFiscalYearId = dst.Id,
-            BalanceSheetAccountsRolled = rollingBalances.Count,
-            RetainedEarningsTransferred = req.Mode == RolloverMode.WithProfitLoss ? netProfit : 0m,
-            Message = resultMsg,
+            BalanceSheetAccountsRolled = bsRolled,
+            RetainedEarningsTransferred = req.Mode == RolloverMode.WithProfitLoss ? retained : 0m,
+            OpeningEntriesCreated = entriesCreated,
+            RolledBulletinId = rolledBulletinId,
+            Message = $"تم إنشاء {currencyNote} كمسودة — راجعها وعدّلها ثم رحّلها يدوياً. نمط: {ModeLabel()}.{bulletinNote}",
         };
     }
 }
@@ -327,24 +464,29 @@ public class UndoRolloverHandler : IRequestHandler<UndoRolloverCommand, UndoRoll
         if (dst.IsClosed)
             throw new DomainException("لا يمكن التراجع عن التدوير بعد إغلاق السنة الهدف. افكّ إغلاقها أولاً.");
 
-        var opening = await _db.JournalEntries
+        // ‎كل القيود الافتتاحية في السنة الهدف (قد تكون عدّة قيود — قيد لكل عملة).
+        var openings = await _db.JournalEntries
             .Include(e => e.Lines)
-            .FirstOrDefaultAsync(e => e.FiscalYearId == dst.Id && e.EntryType == JournalEntryType.Opening, ct)
-            ?? throw new DomainException("لا يوجد قيد افتتاحي في السنة الهدف لإلغائه");
+            .Where(e => e.FiscalYearId == dst.Id && e.EntryType == JournalEntryType.Opening)
+            .ToListAsync(ct);
+        if (openings.Count == 0)
+            throw new DomainException("لا يوجد قيد افتتاحي في السنة الهدف لإلغائه");
 
-        // ‎فحص: هل توجد قيود لاحقة في السنة الهدف بناءً على هذه الأرصدة؟
-        // ‎نسمح بالتراجع لكن نُنبّه المستخدم في الواجهة. هنا نحذف القيد الافتتاحي
-        // ‎ونُعيد العنوان OpeningBalance للحسابات إلى الصفر.
-        var affectedAccountIds = opening.Lines.Select(l => l.AccountId).Distinct().ToList();
+        var affectedAccountIds = openings
+            .SelectMany(o => o.Lines.Select(l => l.AccountId))
+            .Distinct()
+            .ToList();
 
         await using var trx = await _db.BeginTransactionAsync(ct);
 
-        // ‎حذف القيد الافتتاحي وكل أسطره.
-        _db.JournalEntryLines.RemoveRange(opening.Lines);
-        _db.JournalEntries.Remove(opening);
+        // ‎حذف كل القيود الافتتاحية وأسطرها.
+        foreach (var opening in openings)
+        {
+            _db.JournalEntryLines.RemoveRange(opening.Lines);
+            _db.JournalEntries.Remove(opening);
+        }
 
-        // ‎تصفير OpeningBalance للحسابات المتأثّرة (يُمكن للمستخدم لاحقاً
-        // ‎ضبطها يدوياً أو تنفيذ تدوير جديد).
+        // ‎تصفير OpeningBalance للحسابات المتأثّرة.
         var accs = await _db.Accounts
             .Where(a => affectedAccountIds.Contains(a.Id))
             .ToListAsync(ct);
@@ -356,7 +498,6 @@ public class UndoRolloverHandler : IRequestHandler<UndoRolloverCommand, UndoRoll
         int? reopenedId = null;
         if (req.ReopenSource)
         {
-            // ‎السنة المصدر = السنة المالية السابقة (تنتهي قبل بداية السنة الهدف).
             var src = await _db.FiscalYears
                 .Include(f => f.Periods)
                 .Where(f => f.EndDate < dst.StartDate)
@@ -372,15 +513,16 @@ public class UndoRolloverHandler : IRequestHandler<UndoRolloverCommand, UndoRoll
 
         await trx.CommitAsync(ct);
 
+        var deletedFirst = openings[0].Id;
         return new UndoRolloverResultDto
         {
             Success = true,
-            DeletedEntryId = opening.Id,
+            DeletedEntryId = deletedFirst,
             AffectedAccounts = affectedAccountIds.Count,
             ReopenedSourceId = reopenedId,
             Message = reopenedId.HasValue
-                ? $"تم حذف القيد الافتتاحي وتصفير {affectedAccountIds.Count} حساب وفك إغلاق السنة السابقة"
-                : $"تم حذف القيد الافتتاحي وتصفير {affectedAccountIds.Count} حساب",
+                ? $"تم حذف {openings.Count} قيد افتتاحي وتصفير {affectedAccountIds.Count} حساب وفك إغلاق السنة السابقة"
+                : $"تم حذف {openings.Count} قيد افتتاحي وتصفير {affectedAccountIds.Count} حساب",
         };
     }
 }

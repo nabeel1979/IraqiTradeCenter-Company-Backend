@@ -9,6 +9,7 @@ using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.GetAccount
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.GetTrialBalance;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.ManageAccounts;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.ManageJournalEntry;
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.PostDraftJournalEntries;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.PostJournalEntry;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -47,6 +48,16 @@ public class AccountsController : BaseApiController
     {
         var tree = await Mediator.Send(new GetAccountsTreeQuery(includeInactive));
         return Ok(new { success = true, data = tree });
+    }
+
+    /// <summary>
+    /// حسابات محجوبة عن القيود اليومية (صناديق + وسيط تسوية) — للفلترة في الواجهة.
+    /// </summary>
+    [HttpGet("journal-restricted-ids")]
+    public async Task<IActionResult> GetJournalRestrictedAccountIds()
+    {
+        var ids = await Mediator.Send(new GetJournalRestrictedAccountIdsQuery());
+        return Ok(new { success = true, data = ids });
     }
 
     [HttpPost]
@@ -112,6 +123,21 @@ public class AccountsController : BaseApiController
     public async Task<IActionResult> PostJournalEntry([FromBody] PostJournalEntryCommand cmd)
         => HandleResult(await Mediator.Send(cmd));
 
+    /// <summary>ترحيل القيود غير المرحَّلة (مسودة) المطابقة للفلاتر — مع احترام الصلاحيات والسقوف.</summary>
+    [HttpPost("journal-entries/post-drafts")]
+    public async Task<IActionResult> PostDraftJournalEntries(
+        [FromQuery] string? search = null,
+        [FromQuery] DateTime? fromDate = null,
+        [FromQuery] DateTime? toDate = null,
+        [FromQuery] int? voucherTypeId = null,
+        [FromQuery] bool excludeSidebarVoucherTypes = false,
+        CancellationToken ct = default)
+    {
+        var allowed = await ResolveCashBoxScopeAsync(ct);
+        return HandleResult(await Mediator.Send(new PostDraftJournalEntriesCommand(
+            search, fromDate, toDate, voucherTypeId, excludeSidebarVoucherTypes, allowed), ct));
+    }
+
     [HttpGet("journal-entries/{id:int}")]
     public async Task<IActionResult> GetJournalEntryById(int id)
     {
@@ -155,10 +181,11 @@ public class AccountsController : BaseApiController
         [FromQuery] bool valuated = false,
         [FromQuery] int? maxLevel = null,
         [FromQuery] bool leavesOnly = true,
-        [FromQuery] bool includeDraft = false)
+        [FromQuery] bool includeDraft = false,
+        [FromQuery] bool includeOpeningEntries = true)
     {
         var data = await Mediator.Send(new GetAccountBalancesQuery(
-            from, to, accountId, currency, valuated, maxLevel, leavesOnly, includeDraft));
+            from, to, accountId, currency, valuated, maxLevel, leavesOnly, includeDraft, includeOpeningEntries));
         return Ok(new { success = true, data });
     }
 
@@ -170,10 +197,11 @@ public class AccountsController : BaseApiController
         [FromQuery] bool valuated = false,
         [FromQuery] int? maxLevel = null,
         [FromQuery] bool leavesOnly = true,
-        [FromQuery] bool includeDraft = false)
+        [FromQuery] bool includeDraft = false,
+        [FromQuery] bool includeOpeningEntries = true)
     {
         var data = await Mediator.Send(new GetTrialBalanceQuery(
-            from, to, currency, valuated, maxLevel, leavesOnly, includeDraft));
+            from, to, currency, valuated, maxLevel, leavesOnly, includeDraft, includeOpeningEntries));
         return Ok(new { success = true, data });
     }
 
@@ -183,14 +211,15 @@ public class AccountsController : BaseApiController
         [FromQuery] DateTime to,
         [FromQuery] int? accountId = null,
         [FromQuery] string? currency = null,
-        [FromQuery] bool includeDraft = false)
+        [FromQuery] bool includeDraft = false,
+        [FromQuery] bool includeOpeningEntries = true)
     {
         var s = await _authDb.CompanySettings.AsNoTracking().FirstOrDefaultAsync(x => x.Id == 1);
         var baseCur = string.IsNullOrWhiteSpace(s?.Currency) ? "IQD" : s!.Currency!.Trim().ToUpperInvariant();
         var fxJson = s?.ExchangeRatesJson;
 
         var data = await Mediator.Send(new GetAccountStatementQuery(
-            from, to, accountId, currency, includeDraft,
+            from, to, accountId, currency, includeDraft, includeOpeningEntries,
             BaseCurrency: baseCur,
             ExchangeRatesJson: fxJson));
 

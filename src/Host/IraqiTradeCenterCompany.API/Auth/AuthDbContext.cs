@@ -30,6 +30,7 @@ public class AuthDbContext : DbContext
 
     // ── Attachment storage settings (singleton row)
     public DbSet<AttachmentStorageSettings> AttachmentStorageSettings => Set<AttachmentStorageSettings>();
+    public DbSet<MediaBackupSettings> MediaBackupSettings => Set<MediaBackupSettings>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -178,8 +179,25 @@ public class AuthDbContext : DbContext
             e.Property(x => x.R2AccessKeyId).HasMaxLength(200);
             e.Property(x => x.R2SecretAccessKey).HasMaxLength(500);
             e.Property(x => x.R2Bucket).HasMaxLength(100);
+            e.Property(x => x.R2Jurisdiction).HasMaxLength(20).HasDefaultValue("default");
             e.Property(x => x.R2PublicBaseUrl).HasMaxLength(300);
             e.Property(x => x.UpdatedBy).HasMaxLength(100);
+        });
+
+        modelBuilder.Entity<MediaBackupSettings>(e =>
+        {
+            e.ToTable("MediaBackupSettings", "auth");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedNever();
+            e.Property(x => x.MediaRootPath).HasMaxLength(500);
+            e.Property(x => x.AutoBackupCron).HasMaxLength(100);
+            e.Property(x => x.LastRunStatus).HasMaxLength(20).HasDefaultValue("Idle");
+            e.Property(x => x.LastRunError).HasMaxLength(2000);
+            e.Property(x => x.LastRunYearFolder).HasMaxLength(200);
+            e.Property(x => x.UpdatedBy).HasMaxLength(100);
+            e.Property(x => x.SyncDatabaseBackupToR2).HasDefaultValue(false);
+            e.Property(x => x.ServerDatabaseBackupKeepCount).HasDefaultValue(3);
+            e.Property(x => x.R2DatabaseBackupKeepCount).HasDefaultValue(10);
         });
 
         modelBuilder.Entity<Currency>(e =>

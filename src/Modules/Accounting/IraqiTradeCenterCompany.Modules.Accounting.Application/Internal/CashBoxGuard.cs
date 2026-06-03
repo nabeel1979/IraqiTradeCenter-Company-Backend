@@ -5,15 +5,12 @@ using Microsoft.EntityFrameworkCore;
 namespace IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 
 /// <summary>
-/// قواعد حماية حسابات الصناديق:
+/// قواعد حماية حسابات الصناديق وحسابات الوسيط:
 ///   1. الحسابات المرتبطة بصندوق لا يجوز تحريكها عبر قيد عام (JV) — فقط عبر سندات
 ///      قبض/دفع المسجَّلة على نوع سند فيه VoucherTypeId.
-///   2. السندات التي تحرّك صندوقاً يجب أن تحترم سقف المدين/الدائن المعرَّف لذلك
+///   2. حسابات الوسيط (تسوية الحسابات) لا يجوز تحريكها يدوياً — فقط عبر تسوية/مناقلة.
+///   3. السندات التي تحرّك صندوقاً يجب أن تحترم سقف المدين/الدائن المعرَّف لذلك
 ///      الصندوق بتلك العملة (إن وُجد).
-///
-/// هذه الفحوصات تُستدعى من جميع handlers الإدخال/التحديث: PostJournalEntry،
-/// UpdateJournalEntry، UpdateVoucherEntry — لضمان عدم الالتفاف على الحماية من
-/// أي مسار.
 /// </summary>
 internal static class CashBoxGuard
 {
@@ -29,50 +26,56 @@ internal static class CashBoxGuard
     /// <param name="currency">عملة القيد.</param>
     /// <param name="voucherTypeId">معرّف نوع السند — null للقيد العام.</param>
     /// <param name="excludeJournalEntryId">عند التحديث: استثناء قيد قائم من حساب الرصيد الحالي.</param>
+    /// <param name="allowTransitAccounts">true للعمليات النظامية (تسوية/مناقلة) التي تحرّك الوسيط.</param>
     public static async Task<string?> ValidateAsync(
         IAccountingDbContext db,
         IReadOnlyList<LineSnapshot> lines,
         string currency,
         int? voucherTypeId,
         int? excludeJournalEntryId,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool allowTransitAccounts = false)
     {
         var lineAccountIds = lines.Select(l => l.AccountId).Distinct().ToList();
         if (lineAccountIds.Count == 0) return null;
 
-        var cashBoxes = await db.CashBoxes
-            .AsNoTracking()
-            .Include(c => c.Account)
-            .Include(c => c.Currencies)
-            .Where(c => lineAccountIds.Contains(c.AccountId))
-            .ToListAsync(ct);
+        if (!allowTransitAccounts)
+        {
+            var linkedIds = await AccountSettlementLinkedSource.GetAllLinkedAccountIdsAsync(db, ct);
+            var linkedHit = lineAccountIds.FirstOrDefault(linkedIds.Contains);
+            if (linkedHit != 0)
+            {
+                var tName = await db.Accounts.AsNoTracking()
+                    .Where(a => a.Id == linkedHit)
+                    .Select(a => a.NameAr)
+                    .FirstOrDefaultAsync(ct);
+                return $"الحساب '{tName ?? linkedHit.ToString()}' مرتبط بإعدادات تسوية الحسابات — لا يمكن تحريكه يدوياً في القيود. يُستخدم تلقائياً عبر تسوية الحسابات.";
+            }
+        }
 
+        var cashBoxes = await CashBoxPartySource.GetByAccountIdsAsync(db, lineAccountIds, ct);
         if (cashBoxes.Count == 0) return null;
+
+        var boxByAccount = cashBoxes.ToDictionary(b => b.AccountId);
 
         // (1) لا يجوز تحريك حساب صندوق إلا عبر سند (VoucherTypeId مطلوب)
         if (!voucherTypeId.HasValue)
         {
             var firstBox = cashBoxes[0];
-            return $"الحساب '{firstBox.Account?.NameAr ?? firstBox.NameAr}' مرتبط بصندوق ({firstBox.NameAr}) ولا يمكن تحريكه عبر قيد عام — استخدم سند قبض أو سند دفع.";
+            return $"الحساب '{firstBox.NameAr}' مرتبط بصندوق ({firstBox.NameAr}) ولا يمكن تحريكه عبر قيد عام — استخدم سند قبض أو سند دفع.";
         }
 
         // (2) فحص السقوف لكل سطر يلامس صندوقاً
         var cur = (currency ?? "IQD").Trim().ToUpperInvariant();
 
-        foreach (var box in cashBoxes)
+        foreach (var accountId in lineAccountIds.Where(boxByAccount.ContainsKey))
         {
-            // ‎مجموع تأثير السطور الحالية على هذا الصندوق
+            var box = boxByAccount[accountId];
+
             decimal delta = 0m;
             foreach (var l in lines.Where(x => x.AccountId == box.AccountId))
-            {
                 delta += l.IsDebit ? l.Amount : -l.Amount;
-            }
 
-            // ‎الرصيد الحالي قبل هذا القيد (بنفس العملة)
-            //   لا نعتمد على CurrentBalance المخزن — نحسب من الـ ledger لضمان الدقة
-            //   مع استثناء القيد محل التحديث (لو موجود).
-            //   نستخدم join صريحاً لأن JournalEntryLine لا يحوي navigation property
-            //   عكسياً إلى JournalEntry في هذا الـ Domain.
             var ledger = from l in db.JournalEntryLines.AsNoTracking()
                          join e in db.JournalEntries.AsNoTracking() on l.JournalEntryId equals e.Id
                          where l.AccountId == box.AccountId
@@ -91,28 +94,90 @@ internal static class CashBoxGuard
             var currentDebit = await ledger.Where(x => x.IsDebit).SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
             var currentCredit = await ledger.Where(x => !x.IsDebit).SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
             var currentBalance = currentDebit - currentCredit;
-
             var newBalance = currentBalance + delta;
 
-            // ‎السقوف المعرَّفة لهذا الصندوق بالعملة الحالية (إن وُجدت)
-            var cbCur = box.Currencies.FirstOrDefault(c => c.IsActive &&
-                string.Equals(c.Currency, cur, StringComparison.OrdinalIgnoreCase));
-
+            var cbCur = CashBoxPartySource.GetCurrency(box, cur);
             if (cbCur == null)
-            {
-                return $"الصندوق '{box.NameAr}' لا يدعم العملة {cur} — أضف العملة إلى الصندوق أو غيّر عملة السند.";
-            }
+                return $"الصندوق '{box.NameAr}' لا يدعم العملة {cur} — أضف العملة إلى الصندوق في الإدارة المالية أو غيّر عملة السند.";
 
-            // DebitLimit: أقصى رصيد مدين موجب (newBalance ≤ +DebitLimit)
             if (cbCur.DebitLimit.HasValue && newBalance > cbCur.DebitLimit.Value)
             {
                 return $"تم تجاوز السقف المدين للصندوق '{box.NameAr}' ({cur}): الرصيد الناتج {Format(newBalance)} > السقف {Format(cbCur.DebitLimit.Value)}.";
             }
 
-            // CreditLimit: أقصى رصيد دائن (newBalance ≥ -CreditLimit)
             if (cbCur.CreditLimit.HasValue && newBalance < -cbCur.CreditLimit.Value)
             {
                 return $"تم تجاوز السقف الدائن للصندوق '{box.NameAr}' ({cur}): الرصيد الناتج {Format(newBalance)} < السقف -{Format(cbCur.CreditLimit.Value)}.";
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// يتحقق من أن أرصدة الصناديق بعد استبعاد قيود محددة (كأنها محذوفة) لا تتجاوز السقوف.
+    /// يُستخدم قبل الحذف النهائي لتسوية مُلغاة.
+    /// </summary>
+    public static async Task<string?> ValidateAfterExcludingEntriesAsync(
+        IAccountingDbContext db,
+        IReadOnlyList<int> excludeJournalEntryIds,
+        CancellationToken ct)
+    {
+        if (excludeJournalEntryIds.Count == 0) return null;
+
+        var excludedLines = await (
+            from l in db.JournalEntryLines.AsNoTracking()
+            join e in db.JournalEntries.AsNoTracking() on l.JournalEntryId equals e.Id
+            where excludeJournalEntryIds.Contains(e.Id)
+               && e.Status == JournalEntryStatus.Posted
+               && !l.IsDeleted
+               && !e.IsDeleted
+            select new { l.AccountId, e.Currency, l.IsDebit, l.Amount }
+        ).ToListAsync(ct);
+
+        if (excludedLines.Count == 0) return null;
+
+        var accountIds = excludedLines.Select(x => x.AccountId).Distinct().ToList();
+        var cashBoxes = await CashBoxPartySource.GetByAccountIdsAsync(db, accountIds, ct);
+        if (cashBoxes.Count == 0) return null;
+
+        var boxByAccount = cashBoxes.ToDictionary(b => b.AccountId);
+
+        foreach (var grp in excludedLines.GroupBy(x => (
+            x.AccountId,
+            Cur: (x.Currency ?? "IQD").Trim().ToUpperInvariant())))
+        {
+            if (!boxByAccount.TryGetValue(grp.Key.AccountId, out var box)) continue;
+
+            decimal removedDelta = 0m;
+            foreach (var l in grp)
+                removedDelta += l.IsDebit ? l.Amount : -l.Amount;
+
+            var ledger = from l in db.JournalEntryLines.AsNoTracking()
+                         join e in db.JournalEntries.AsNoTracking() on l.JournalEntryId equals e.Id
+                         where l.AccountId == grp.Key.AccountId
+                            && e.Currency == grp.Key.Cur
+                            && e.Status == JournalEntryStatus.Posted
+                            && !l.IsDeleted
+                            && !e.IsDeleted
+                         select new { l.IsDebit, l.Amount };
+
+            var currentDebit = await ledger.Where(x => x.IsDebit).SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
+            var currentCredit = await ledger.Where(x => !x.IsDebit).SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
+            var futureBalance = (currentDebit - currentCredit) - removedDelta;
+
+            var cbCur = CashBoxPartySource.GetCurrency(box, grp.Key.Cur);
+            if (cbCur == null)
+                return $"الصندوق '{box.NameAr}' لا يدعم العملة {grp.Key.Cur}.";
+
+            if (cbCur.DebitLimit.HasValue && futureBalance > cbCur.DebitLimit.Value)
+            {
+                return $"لا يمكن حذف التسوية: الرصيد الناتج للصندوق '{box.NameAr}' ({grp.Key.Cur}) {Format(futureBalance)} يتجاوز السقف المدين {Format(cbCur.DebitLimit.Value)}.";
+            }
+
+            if (cbCur.CreditLimit.HasValue && futureBalance < -cbCur.CreditLimit.Value)
+            {
+                return $"لا يمكن حذف التسوية: الرصيد الناتج للصندوق '{box.NameAr}' ({grp.Key.Cur}) {Format(futureBalance)} يتجاوز السقف الدائن -{Format(cbCur.CreditLimit.Value)}.";
             }
         }
 

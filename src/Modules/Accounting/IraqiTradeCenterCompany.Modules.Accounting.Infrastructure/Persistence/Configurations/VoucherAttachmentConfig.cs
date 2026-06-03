@@ -20,6 +20,10 @@ public class VoucherAttachmentConfig : IEntityTypeConfiguration<VoucherAttachmen
         b.Property(x => x.UploadedByUserName).HasMaxLength(150);
         b.Property(x => x.Notes).HasMaxLength(500);
 
+        // ‎موقع النسخ: محلي/R2. يبدآن (true,false) عند الرفع. يصبح IsOnR2=true بعد المزامنة.
+        b.Property(x => x.IsOnLocal).HasDefaultValue(true);
+        b.Property(x => x.IsOnR2).HasDefaultValue(false);
+
         // ‎ربط هيدر القيد بمرفقاته (Cascade حذف ناعم — لا نتركها معلَّقة).
         b.HasOne(x => x.JournalEntry)
             .WithMany()

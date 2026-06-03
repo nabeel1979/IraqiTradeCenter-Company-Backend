@@ -13,8 +13,12 @@ public class DeleteJournalEntryHandler : IRequestHandler<DeleteJournalEntryComma
 {
     private readonly IAccountingDbContext _db;
     private readonly IAuditLogger _audit;
-    public DeleteJournalEntryHandler(IAccountingDbContext db, IAuditLogger audit)
-    { _db = db; _audit = audit; }
+    private readonly IVoucherAttachmentDeletionService _attachmentDeletion;
+    public DeleteJournalEntryHandler(
+        IAccountingDbContext db,
+        IAuditLogger audit,
+        IVoucherAttachmentDeletionService attachmentDeletion)
+    { _db = db; _audit = audit; _attachmentDeletion = attachmentDeletion; }
 
     public async Task<Result<bool>> Handle(DeleteJournalEntryCommand req, CancellationToken ct)
     {
@@ -28,7 +32,10 @@ public class DeleteJournalEntryHandler : IRequestHandler<DeleteJournalEntryComma
         if (entry.ReferenceType == "CashBoxTransfer" || entry.ReferenceType == "CashBoxTransferReversal")
             return Result.Failure<bool>(
                 "هذا القيد مولَّد من مناقلة بين صندوقَين — لا يُحذف من نافذة القيود اليومية. " +
-                "افتح صفحة الصناديق ⇒ تبويب 'المناقلات' لإلغاء المناقلة أو التراجع عن الاستلام.");
+                "افتح صفحة مناقلات الصناديق لإلغاء المناقلة أو التراجع عن الاستلام.");
+        if (entry.ReferenceType == "AccountSettlement" || entry.ReferenceType == "AccountSettlementReversal")
+            return Result.Failure<bool>(
+                "هذا القيد مولَّد من تسوية حسابات — لا يُحذف من نافذة القيود اليومية.");
 
         // ‎حارس السنة المالية النشطة: لا يُحذف قيد ينتمي لسنة مالية غير المُفَعَّلة.
         var activeFy = await _db.FiscalYears.AsNoTracking()
@@ -58,6 +65,8 @@ public class DeleteJournalEntryHandler : IRequestHandler<DeleteJournalEntryComma
         if (entry.Source != JournalEntrySource.Manual)
             return Result.Failure<bool>($"هذا القيد مولَّد من ({entry.Source}) — يُحذف من نافذة المصدر");
 
+        var deletedAttachments = await _attachmentDeletion.DeleteAllForJournalEntryAsync(req.Id, ct);
+
         entry.MarkAsDeleted();
         foreach (var line in entry.Lines) line.MarkAsDeleted();
 
@@ -68,7 +77,7 @@ public class DeleteJournalEntryHandler : IRequestHandler<DeleteJournalEntryComma
             entityId: entry.Id.ToString(),
             action: AuditActions.Delete,
             summary: $"حذف قيد رقم {entry.EntryNumber} — {entry.Description}",
-            details: new { entry.EntryNumber, entry.VoucherTypeId, entry.VoucherSequence, entry.TotalDebit, entry.TotalCredit },
+            details: new { entry.EntryNumber, entry.VoucherTypeId, entry.VoucherSequence, entry.TotalDebit, entry.TotalCredit, deletedAttachments },
             ct: ct);
 
         return Result.Success(true);

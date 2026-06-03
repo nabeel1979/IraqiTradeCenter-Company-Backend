@@ -20,7 +20,11 @@ public record UpdateJournalEntryCommand(
     bool PostImmediately = true,
     int? VoucherTypeId = null,
     /// <summary>الرقم اليدوي — يُحفظ كما هو ويُستخدم في البحث.</summary>
-    string? ManualNumber = null
+    string? ManualNumber = null,
+    /// <summary>سعر صرف يدوي اختياري (يُستخدم حين لا توجد نشرة تُسعّر العملة بتاريخ القيد).</summary>
+    decimal? ManualExchangeRate = null,
+    /// <summary>عملية السعر اليدوي: 1=ضرب (افتراضي)، 2=قسمة.</summary>
+    int? ManualExchangeRateOperation = null
 ) : IRequest<Result<int>>;
 
 public record UpdateJournalLine(int AccountId, bool IsDebit, decimal Amount, string? Description);
@@ -56,13 +60,18 @@ public class UpdateJournalEntryHandler : IRequestHandler<UpdateJournalEntryComma
                 return Result.Failure<int>(
                     "هذا القيد مولَّد من مناقلة بين صندوقَين — لا يمكن تعديله من نافذة القيود اليومية. " +
                     "افتح صفحة الصناديق ⇒ تبويب 'المناقلات' وقم بالتراجع عن الاستلام أو الإلغاء أولاً.");
+            if (entry.ReferenceType == "AccountSettlement" || entry.ReferenceType == "AccountSettlementReversal")
+                return Result.Failure<int>(
+                    "هذا القيد مولَّد من تسوية حسابات — لا يمكن تعديله من نافذة القيود اليومية.");
 
             // ‎حارس السنة المالية النشطة:
             //   يُمنع تعديل قيد إذا كان تاريخه الأصلي (في قاعدة البيانات) خارج
             //   نطاق السنة المالية المُفَعَّلة. لا يُسمح بالالتفاف على ذلك بتغيير
             //   حقل التاريخ في الـ payload لأن المرجع هو القيمة المخزَّنة.
             var activeFy = await _db.FiscalYears.AsNoTracking()
-                .FirstOrDefaultAsync(f => f.IsActive, ct);
+                .Where(f => f.IsActive)
+                .OrderByDescending(f => f.StartDate)
+                .FirstOrDefaultAsync(ct);
             if (activeFy != null)
             {
                 var originalDate = entry.EntryDate.Date;
@@ -111,8 +120,9 @@ public class UpdateJournalEntryHandler : IRequestHandler<UpdateJournalEntryComma
             var nonLeaf = accounts.FirstOrDefault(a => !a.IsLeaf);
             if (nonLeaf != null) return Result.Failure<int>($"الحساب '{nonLeaf.NameAr}' حساب رئيسي - لا يقبل قيوداً");
 
-            // التحقق من تسعير العملة في نشرة الأسعار
-            var currencyCheck = await EnsureCurrencyHasActiveBulletin(req.Currency, req.EntryDate, ct);
+            // التحقق من تسعير العملة في نشرة الأسعار (يُسمح بسعر صرف يدوي عند غياب النشرة)
+            var currencyCheck = await CurrencyBulletinGuard.CheckAsync(
+                _db, req.Currency, req.EntryDate, req.ManualExchangeRate, ct);
             if (currencyCheck != null) return Result.Failure<int>(currencyCheck);
 
             // ‎فحص قواعد الصناديق (سقوف + منع استخدامها في قيد عام)
@@ -124,6 +134,11 @@ public class UpdateJournalEntryHandler : IRequestHandler<UpdateJournalEntryComma
                 excludeJournalEntryId: entry.Id,
                 ct);
             if (cashBoxCheck != null) return Result.Failure<int>(cashBoxCheck);
+
+            // ‎فحص صلاحية العملة للأطراف المالية: الحساب المقابل يجب أن يدعم عملة السند.
+            var partyCheck = await FinancialPartyGuard.ValidateAsync(
+                _db, accountIds, req.Currency, ct);
+            if (partyCheck != null) return Result.Failure<int>(partyCheck);
 
             // التحقق من نوع السند إن وُجد
             if (req.VoucherTypeId.HasValue)
@@ -139,7 +154,8 @@ public class UpdateJournalEntryHandler : IRequestHandler<UpdateJournalEntryComma
             // إلغاء علامة "ترحيل فوري" أثناء التعديل.
             if (entry.Status == JournalEntryStatus.Posted) entry.Unpost();
 
-            entry.UpdateBasic(req.EntryDate, req.Description, req.EntryType, req.Currency, req.VoucherTypeId, req.ManualNumber);
+            entry.UpdateBasic(req.EntryDate, req.Description, req.EntryType, req.Currency, req.VoucherTypeId, req.ManualNumber,
+                req.ManualExchangeRate, req.ManualExchangeRateOperation);
             entry.ReplaceLines(req.Lines.Select(l =>
                 (l.AccountId, l.IsDebit, l.Amount, l.Description)).ToList());
 
@@ -175,37 +191,5 @@ public class UpdateJournalEntryHandler : IRequestHandler<UpdateJournalEntryComma
         }
         catch (UnbalancedJournalEntryException ex) { return Result.Failure<int>(ex.Message); }
         catch (DomainException ex) { return Result.Failure<int>(ex.Message); }
-    }
-
-    /// <summary>
-    /// إذا كانت العملة غير العملة الرئيسية للنشرة المنشورة الأحدث، يجب أن يكون هناك سطر سعر صرف لها.
-    /// إن لم توجد نشرة منشورة سارية أصلاً، يُرفض القيد بعملة غير IQD (الافتراضية للنظام).
-    /// </summary>
-    private async Task<string?> EnsureCurrencyHasActiveBulletin(string currency, DateTime entryDate, CancellationToken ct)
-    {
-        var cur = (currency ?? "IQD").Trim().ToUpperInvariant();
-        var atUtc = (entryDate.Kind == DateTimeKind.Utc ? entryDate : entryDate.ToUniversalTime())
-            .Date.AddDays(1).AddTicks(-1);
-
-        var bulletin = await _db.CurrencyRateBulletins
-            .Include(b => b.Lines)
-            .Where(b => b.Status == CurrencyRateBulletinStatus.Published && b.EffectiveAt <= atUtc)
-            .OrderByDescending(b => b.EffectiveAt).ThenByDescending(b => b.Id)
-            .FirstOrDefaultAsync(ct);
-
-        if (bulletin != null && string.Equals(bulletin.BaseCurrency, cur, StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        if (bulletin == null)
-        {
-            if (cur == "IQD") return null;
-            return $"العملة {cur} غير مُسعَّرة في نشرة الأسعار — لا توجد نشرة منشورة سارية بتاريخ {entryDate:yyyy-MM-dd}. أصدِر نشرة أسعار وانشرها قبل حفظ القيد.";
-        }
-
-        var hasLine = bulletin.Lines.Any(l => string.Equals(l.Currency, cur, StringComparison.OrdinalIgnoreCase));
-        if (!hasLine)
-            return $"العملة {cur} غير مُسعَّرة في نشرة الأسعار '{bulletin.Name}'. أضف سعر صرف لها في النشرة أو أصدر نشرة جديدة تتضمنها قبل حفظ القيد.";
-
-        return null;
     }
 }

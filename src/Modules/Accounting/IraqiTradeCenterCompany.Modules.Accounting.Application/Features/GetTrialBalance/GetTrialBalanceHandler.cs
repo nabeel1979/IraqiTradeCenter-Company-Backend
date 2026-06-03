@@ -1,4 +1,5 @@
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Dtos;
+using IraqiTradeCenterCompany.Modules.Accounting.Application.Internal;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using MediatR;
@@ -10,12 +11,9 @@ namespace IraqiTradeCenterCompany.Modules.Accounting.Application.Features.GetTri
 /// مُعالج ميزان المراجعة الموسَّع.
 ///
 /// لكل حساب يُحسب:
-///   1) الافتتاحي (الفترة السابقة):
-///        - حركة Normal لجميع القيود قبل @from
-///        - + كل قيود Opening (النوع 2) حتى @to (الافتتاحي يُحسب دائماً ضمن الافتتاحي ولا يُعرَض كحركة)
-///        - يُحوَّل صافي (مدين − دائن) إلى عمودَي OpeningDebit/OpeningCredit بحسب الإشارة.
-///   2) حركة الفترة الحالية (PeriodDebit/PeriodCredit):
-///        - مجموع المدين والدائن لحركات Normal خلال [@from, @to].
+///   1) الافتتاحي: فقط إذا بدأ التقرير بعد بداية السنة المالية (from &gt; plFyStart) —
+///      أي «الرجوع في التاريخ» داخل السنة. عند from = بداية السنة: افتتاحي = 0 (قاعدة فارغة).
+///   2) حركة الفترة: كل القيود ضمن [@from, @to] فقط — كل حركة في فترتها (بما فيها الافتتاحي/التدوير).
 ///   3) الرصيد الختامي (ClosingDebit/ClosingCredit):
 ///        - افتتاحي مع جانبه + (مدين الفترة − دائن الفترة) ⇒ يُسجَّل في عموده وفق الإشارة.
 ///
@@ -98,6 +96,9 @@ public class GetTrialBalanceHandler : IRequestHandler<GetTrialBalanceQuery, Tria
             if (activeFy != null) plFyStart = activeFy.StartDate.Date;
         }
 
+        // ‎قاعدة «قاعدة بيانات فارغة»: لا افتتاحي مرحّل إلا عند الرجوع داخل السنة (from بعد plFyStart).
+        var includePriorOpening = !plFyStart.HasValue || fromDate > plFyStart.Value;
+
         // ───────────────────────────────────────────────────────────
         // 1) جلب نشرة الأسعار (للتقويم) — أحدث نشرة منشورة سارية على @to
         // ───────────────────────────────────────────────────────────
@@ -127,18 +128,16 @@ public class GetTrialBalanceHandler : IRequestHandler<GetTrialBalanceQuery, Tria
         bool fxFallback = false;
 
         // ───────────────────────────────────────────────────────────
-        // 2) جلب جميع الحسابات النشطة دفعةً واحدة، ثم نشتق:
-        //    • allAccounts  : كل الحسابات (للوصول إلى ParentId / Type / IsLeaf
-        //                      عند تجميع الأرصدة على الآباء وحساب الإجماليات).
-        //    • leafAccounts : الأوراق فقط — ستُستخدم لحساب الإجماليات و
-        //                      نتيجة الفترة (الإيرادات/المصاريف). الإجماليات
-        //                      تُجمَع دائماً من الأوراق بصرف النظر عمّا يَعرضه
-        //                      المستخدم (المستوى/الأبناء فقط) لأنّ هذه الفلاتر
-        //                      تخصّ العرض فقط ولا يجوز أن تُصفّر الإجمالي.
-        //    • accounts     : الحسابات التي ستُعرَض في الجدول (وفق فلاتر العرض).
+        // 2) جلب الحسابات:
+        //    • allAccounts       — للعرض (بدون المستبعدة من التقارير)
+        //    • allActiveLeaves   — كل الأوراق النشطة (تُضمَّن الوسيط) لحساب إجماليات
+        //                          ميزان المراجعة — قيود التسوية متعددة العملات تمر عبر
+        //                          حسابات وسيط مخفية؛ استبعادها من الإجمالي يُفقد التوازن.
+        //    • leafAccounts      — أوراق العرض (بدون المستبعدة)
+        //    • accounts          — صفوف الجدول المعروضة
         // ───────────────────────────────────────────────────────────
         var allAccounts = await _db.Accounts.AsNoTracking()
-            .Where(a => a.IsActive)
+            .Where(a => a.IsActive && !a.IsExcludedFromReports)
             .OrderBy(a => a.Code)
             .Select(a => new
             {
@@ -151,6 +150,11 @@ public class GetTrialBalanceHandler : IRequestHandler<GetTrialBalanceQuery, Tria
                 a.IsLeaf,
                 a.ParentId,
             })
+            .ToListAsync(ct);
+
+        var allActiveLeaves = await _db.Accounts.AsNoTracking()
+            .Where(a => a.IsActive && a.IsLeaf)
+            .Select(a => new { a.Id, a.Type })
             .ToListAsync(ct);
 
         var leafAccounts = allAccounts.Where(a => a.IsLeaf).ToList();
@@ -177,14 +181,7 @@ public class GetTrialBalanceHandler : IRequestHandler<GetTrialBalanceQuery, Tria
         }
 
         // ───────────────────────────────────────────────────────────
-        // 3) السحب الأوّل: الافتتاحي لكل (حساب × عملة)
-        //    قاعدة التضمين تختلف بحسب نوع الحساب:
-        //      • أصول/خصوم/حقوق ملكية (1،2،3): جميع قيود Normal قبل @from + قيود Opening حتى @to
-        //      • إيرادات/مصاريف     (4،5): فقط قيود Normal من بداية السنة المالية
-        //                                     الحالية (@plFyStart) حتى @from. قيود Opening
-        //                                     لا تُحسب لأن طبيعة هذه الحسابات تُصفَّر سنوياً.
-        //    إن كان @plFyStart NULL (لا توجد سنة مالية)، نُبقي السلوك القديم لـ P&L
-        //    (يَجمع كامل التاريخ) لتفادي حذف بيانات بدون قاعدة بديلة.
+        // 3) السحب الأوّل: الافتتاحي (فارغ عند from = بداية السنة المالية)
         var openingSql = @"
 SELECT l.AccountId, e.Currency,
        ISNULL(SUM(CASE WHEN l.IsDebit = 1 THEN l.Amount ELSE 0 END), 0) AS Dr,
@@ -194,25 +191,12 @@ INNER JOIN acc.JournalEntries e ON e.Id = l.JournalEntryId
 INNER JOIN acc.Accounts a       ON a.Id = l.AccountId
 WHERE l.IsDeleted = 0 AND e.IsDeleted = 0
   AND e.[Status] IN (" + string.Join(",", statusInts) + @")
-  AND (
-        -- ‎الميزانية: كامل التاريخ قبل @from (لـ Normal) + Opening حتى @to
-        (a.[Type] IN (1,2,3) AND (
-            (e.EntryType = 1 AND e.EntryDate < @from)
-         OR (e.EntryType = 2 AND e.EntryDate <= @to)
-        ))
-     OR
-        -- ‎الأرباح/الخسائر: فقط ضمن السنة المالية الحالية
-        (a.[Type] IN (4,5) AND e.EntryType = 1 AND e.EntryDate < @from
-            AND (@plFyStart IS NULL OR e.EntryDate >= @plFyStart))
-      )
+  AND " + ReportEntrySqlFragments.TrialBalanceOpeningBalanceWhere(req.IncludeOpeningEntries, includePriorOpening) + @"
   AND (@currency IS NULL OR UPPER(e.Currency) = @currency)
 GROUP BY l.AccountId, e.Currency;";
 
         // ───────────────────────────────────────────────────────────
-        // 4) السحب الثاني: حركة الفترة لكل (حساب × عملة) — Normal فقط
-        //    لحسابات الأرباح/الخسائر نقصر الحركة كذلك على نطاق السنة المالية
-        //    الحالية حتى لو امتدّ مدى التقرير لسنوات سابقة (لأن قيود تلك
-        //    السنوات تخصّ نتيجة سنة منفصلة، لا تُجمع مع السنة الحالية).
+        // 4) السحب الثاني: حركة الفترة — كل القيود ضمن [@from, @to] فقط
         // ───────────────────────────────────────────────────────────
         var periodSql = @"
 SELECT l.AccountId, e.Currency,
@@ -223,11 +207,8 @@ INNER JOIN acc.JournalEntries e ON e.Id = l.JournalEntryId
 INNER JOIN acc.Accounts a       ON a.Id = l.AccountId
 WHERE l.IsDeleted = 0 AND e.IsDeleted = 0
   AND e.[Status] IN (" + string.Join(",", statusInts) + @")
-  AND e.EntryType = 1
+  AND " + ReportEntrySqlFragments.PeriodEntryTypeFilter(req.IncludeOpeningEntries) + @"
   AND e.EntryDate >= @from AND e.EntryDate <= @to
-  AND (a.[Type] IN (1,2,3)
-       OR (a.[Type] IN (4,5)
-            AND (@plFyStart IS NULL OR e.EntryDate >= @plFyStart)))
   AND (@currency IS NULL OR UPPER(e.Currency) = @currency)
 GROUP BY l.AccountId, e.Currency;";
 
@@ -242,6 +223,7 @@ GROUP BY l.AccountId, e.Currency;";
         {
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = sql;
+            _db.ConfigureDbCommand(cmd);
             AddParam(cmd, "@from", fromDate);
             AddParam(cmd, "@to", toDate);
             AddParam(cmd, "@currency", (object?)currencyFilter ?? DBNull.Value);
@@ -321,14 +303,15 @@ GROUP BY l.AccountId, e.Currency;";
         }
 
         // ───────────────────────────────────────────────────────────
-        // 7) حساب الإجماليات و نتيجة الفترة (الإيرادات/المصاريف) من جميع
-        //    الأوراق النشطة دائماً — بصرف النظر عن فلاتر العرض (LeavesOnly /
-        //    MaxLevel). فلاتر العرض تخصّ الجدول فقط ولا يجوز أن تُصفّر الإجمالي.
+        // 7) حساب الإجماليات و نتيجة الفترة من جميع الأوراق النشطة
+        //    (بما فيها حسابات الوسيط المخفية) — ضروري لتوازن ميزان
+        //    المراجعة بعد تسويات الحسابات متعددة العملات.
+        //    نتيجة الإيرادات/المصاريف تبقى من الحسابات الظاهرة فقط.
         // ───────────────────────────────────────────────────────────
         decimal totOpDr = 0, totOpCr = 0, totPDr = 0, totPCr = 0, totCDr = 0, totCCr = 0;
         decimal totRevenue = 0, totExpense = 0;
 
-        foreach (var a in leafAccounts)
+        foreach (var a in allActiveLeaves)
         {
             var (openDr, openCr, perDr, perCr) = AggregateForAccount(a.Id);
             var openingNet = openDr - openCr;
@@ -344,8 +327,11 @@ GROUP BY l.AccountId, e.Currency;";
             totPCr += perCr;
             totCDr += cDr;
             totCCr += cCr;
+        }
 
-            // ‎نتيجة الفترة: الإيرادات (طبيعة دائنة) − المصاريف (طبيعة مدينة)
+        foreach (var a in leafAccounts)
+        {
+            var (openDr, openCr, perDr, perCr) = AggregateForAccount(a.Id);
             if (a.Type == AccountType.Revenue) totRevenue += (perCr - perDr);
             else if (a.Type == AccountType.Expense) totExpense += (perDr - perCr);
         }

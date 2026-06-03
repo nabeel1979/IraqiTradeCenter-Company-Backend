@@ -35,15 +35,8 @@ public class CashBoxTransferConfig : IEntityTypeConfiguration<CashBoxTransfer>
         b.HasIndex(x => x.ReceiveJournalEntryId);
         b.HasIndex(x => x.Status);
 
-        b.HasOne(x => x.FromCashBox)
-            .WithMany()
-            .HasForeignKey(x => x.FromCashBoxId)
-            .OnDelete(DeleteBehavior.NoAction);
-
-        b.HasOne(x => x.ToCashBox)
-            .WithMany()
-            .HasForeignKey(x => x.ToCashBoxId)
-            .OnDelete(DeleteBehavior.NoAction);
+        b.Ignore(x => x.FromCashBox);
+        b.Ignore(x => x.ToCashBox);
 
         b.HasOne(x => x.TransitAccount)
             .WithMany()

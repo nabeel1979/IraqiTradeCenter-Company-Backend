@@ -28,4 +28,20 @@ public static class PasswordHelper
             Iterations, HashAlgorithmName.SHA256, KeySize);
         return CryptographicOperations.FixedTimeEquals(expected, actual);
     }
+
+    private const string PasswordChars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%";
+
+    /// <summary>كلمة مرور عشوائية آمنة (بدون أحرف مُلتبسة مثل 0/O/I/l/1).</summary>
+    public static string Generate(int length = 12)
+    {
+        if (length < 8) length = 8;
+        var bytes = RandomNumberGenerator.GetBytes(length);
+        var chars = new char[length];
+        for (var i = 0; i < length; i++)
+            chars[i] = PasswordChars[bytes[i] % PasswordChars.Length];
+        return new string(chars);
+    }
+
+    public static bool IsStrongEnough(string password, int minLength = 8)
+        => !string.IsNullOrWhiteSpace(password) && password.Length >= minLength;
 }

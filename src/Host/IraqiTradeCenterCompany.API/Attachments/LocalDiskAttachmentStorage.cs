@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -129,9 +130,14 @@ public class LocalDiskAttachmentStorage : IAttachmentStorage
     private static string SanitizeFolder(string folder)
     {
         if (string.IsNullOrWhiteSpace(folder)) return string.Empty;
-        var clean = new string(folder.Select(c =>
-            c == '/' || c == '_' || c == '-' || char.IsLetterOrDigit(c) ? c : '_').ToArray());
-        return clean.Replace("..", "_").Trim('/');
+        var invalid = Path.GetInvalidFileNameChars().Concat(new[] { '/', '\\' }).ToHashSet();
+        var segments = folder.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var clean = segments.Select(seg =>
+        {
+            var s = new string(seg.Select(c => invalid.Contains(c) ? '_' : c).ToArray()).Trim();
+            return string.IsNullOrWhiteSpace(s) ? "unknown" : s.Replace("..", "_");
+        });
+        return string.Join('/', clean);
     }
 
     private static string SanitizeFileName(string name)

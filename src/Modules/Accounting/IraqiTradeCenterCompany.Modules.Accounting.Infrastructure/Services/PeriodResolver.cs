@@ -14,8 +14,23 @@ internal class PeriodResolver : IPeriodResolver
 
     public async Task<(int FiscalYearId, int PeriodId)> ResolveAsync(DateTime date, CancellationToken ct = default)
     {
-        var period = await _db.AccountingPeriods.AsNoTracking()
-            .FirstOrDefaultAsync(p => p.StartDate <= date && p.EndDate >= date, ct);
+        // ‎عند تداخل فترات سنوات متعددة (مثلاً سنة جزئية + سنة كاملة بنفس البداية):
+        // ‎نفضّل السنة المُفعَّلة IsActive، ثم الأحدث بدايةً — حتى تُسجَّل القيود في السنة الصحيحة.
+        var d = date.Date;
+        var matches = await (
+            from p in _db.AccountingPeriods.AsNoTracking()
+            join fy in _db.FiscalYears.AsNoTracking() on p.FiscalYearId equals fy.Id
+            where p.StartDate <= d && p.EndDate >= d
+            select new { Period = p, FiscalYear = fy }
+        ).ToListAsync(ct);
+
+        var chosen = matches
+            .OrderByDescending(x => x.FiscalYear.IsActive)
+            .ThenByDescending(x => x.FiscalYear.StartDate)
+            .ThenByDescending(x => x.Period.StartDate)
+            .FirstOrDefault();
+
+        var period = chosen?.Period;
         if (period == null) throw new DomainException($"لا توجد فترة محاسبية للتاريخ {date:yyyy-MM-dd}");
         if (period.Status == PeriodStatus.Closed || period.Status == PeriodStatus.Locked)
             throw new ClosedPeriodException(date);

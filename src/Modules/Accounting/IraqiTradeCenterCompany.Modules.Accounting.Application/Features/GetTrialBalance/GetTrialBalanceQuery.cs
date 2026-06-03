@@ -20,5 +20,7 @@ public record GetTrialBalanceQuery(
     /// <summary>true = حسابات الأبناء فقط (Leaves) — false = جميع الحسابات</summary>
     bool LeavesOnly = true,
     /// <summary>true = تضمين القيود غير المُرحَّلة (Draft) — افتراضي false</summary>
-    bool IncludeDraft = false
+    bool IncludeDraft = false,
+    /// <summary>true = تضمين القيود الافتتاحية (Opening) مع احترام تاريخها</summary>
+    bool IncludeOpeningEntries = true
 ) : IRequest<TrialBalanceDto>;

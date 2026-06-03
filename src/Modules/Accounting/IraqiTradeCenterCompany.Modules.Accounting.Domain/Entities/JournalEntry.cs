@@ -31,6 +31,14 @@ public class JournalEntry : BaseEntity
     /// </summary>
     public string? ManualNumber { get; private set; }
     public string Currency { get; private set; } = "IQD";
+    /// <summary>
+    /// سعر صرف يدوي اختياري يُحفَظ على القيد. يُستخدم لتقويم القيد عند غياب نشرة
+    /// تُسعّر عملته بتاريخه، أو لتثبيت سعر تاريخي خاص بهذا القيد. NULL = استخدام
+    /// سعر النشرة المعتمدة عند التقويم.
+    /// </summary>
+    public decimal? ManualExchangeRate { get; private set; }
+    /// <summary>عملية السعر اليدوي: 1=ضرب (Base=Foreign×Rate)، 2=قسمة (Base=Foreign÷Rate).</summary>
+    public int? ManualExchangeRateOperation { get; private set; }
     public string Description { get; private set; } = default!;
     public decimal TotalDebit { get; private set; }
     public decimal TotalCredit { get; private set; }
@@ -48,10 +56,13 @@ public class JournalEntry : BaseEntity
                                        string description, string? refType = null, int? refId = null, string? refNumber = null,
                                        JournalEntryType type = JournalEntryType.Normal, string currency = "IQD",
                                        string? entryNumber = null, int? voucherTypeId = null,
-                                       int? voucherSequence = null, string? manualNumber = null)
+                                       int? voucherSequence = null, string? manualNumber = null,
+                                       decimal? manualExchangeRate = null, int? manualExchangeRateOperation = null)
     {
         if (string.IsNullOrWhiteSpace(entryNumber))
             throw new DomainException("رقم القيد مطلوب");
+
+        var (mxr, mxrOp) = NormalizeManualRate(manualExchangeRate, manualExchangeRateOperation);
 
         return new JournalEntry
         {
@@ -63,9 +74,22 @@ public class JournalEntry : BaseEntity
             VoucherSequence = voucherSequence,
             ManualNumber = NormalizeManualNumber(manualNumber),
             Currency = string.IsNullOrWhiteSpace(currency) ? "IQD" : currency.Trim().ToUpperInvariant(),
+            ManualExchangeRate = mxr,
+            ManualExchangeRateOperation = mxrOp,
             Description = string.IsNullOrWhiteSpace(description) ? "—" : description.Trim(),
             ReferenceType = refType, ReferenceId = refId, ReferenceNumber = refNumber
         };
+    }
+
+    /// <summary>
+    /// يطبّع سعر الصرف اليدوي: قيمة ≤ 0 → null. العملية تُقصَر على 1 (ضرب) أو
+    /// 2 (قسمة)، وتُعاد null تماماً عند غياب السعر لتفادي بيانات يتيمة.
+    /// </summary>
+    private static (decimal? Rate, int? Operation) NormalizeManualRate(decimal? rate, int? operation)
+    {
+        if (!rate.HasValue || rate.Value <= 0m) return (null, null);
+        var op = operation == 2 ? 2 : 1;
+        return (rate.Value, op);
     }
 
     /// <summary>
@@ -102,7 +126,8 @@ public class JournalEntry : BaseEntity
     }
 
     public void UpdateBasic(DateTime entryDate, string description, JournalEntryType type, string currency,
-                            int? voucherTypeId = null, string? manualNumber = null)
+                            int? voucherTypeId = null, string? manualNumber = null,
+                            decimal? manualExchangeRate = null, int? manualExchangeRateOperation = null)
     {
         if (Status == JournalEntryStatus.Reversed) throw new DomainException("لا يمكن تعديل قيد معكوس");
         EntryDate = entryDate;
@@ -111,6 +136,16 @@ public class JournalEntry : BaseEntity
         VoucherTypeId = voucherTypeId;
         ManualNumber = NormalizeManualNumber(manualNumber);
         Currency = string.IsNullOrWhiteSpace(currency) ? "IQD" : currency.Trim().ToUpperInvariant();
+        var (mxr, mxrOp) = NormalizeManualRate(manualExchangeRate, manualExchangeRateOperation);
+        ManualExchangeRate = mxr;
+        ManualExchangeRateOperation = mxrOp;
+    }
+
+    /// <summary>إزالة ربط نوع السند — يُستخدم عند حذف أنواع نظامية داخلية معطّلة.</summary>
+    public void DetachVoucherType()
+    {
+        VoucherTypeId = null;
+        VoucherSequence = null;
     }
 
     public void ReplaceLines(IReadOnlyList<(int AccountId, bool IsDebit, decimal Amount, string? Description)> newLines)

@@ -1,7 +1,9 @@
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Entities;
+using IraqiTradeCenterCompany.SharedKernel.Contacts;
 using IraqiTradeCenterCompany.SharedKernel.Exceptions;
+using IraqiTradeCenterCompany.SharedKernel.Interfaces;
 using IraqiTradeCenterCompany.SharedKernel.Models;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
@@ -12,7 +14,13 @@ public class UpdateFinancialPartyHandler
     : IRequestHandler<UpdateFinancialPartyCommand, Result<bool>>
 {
     private readonly IAccountingDbContext _db;
-    public UpdateFinancialPartyHandler(IAccountingDbContext db) => _db = db;
+    private readonly IContactRegistry _contacts;
+
+    public UpdateFinancialPartyHandler(IAccountingDbContext db, IContactRegistry contacts)
+    {
+        _db = db;
+        _contacts = contacts;
+    }
 
     public async Task<Result<bool>> Handle(UpdateFinancialPartyCommand req, CancellationToken ct)
     {
@@ -45,22 +53,6 @@ public class UpdateFinancialPartyHandler
                     return Result.Failure<bool>("الاسم الإنجليزي مكرر في هذا النوع");
             }
 
-            var phone = req.Phone?.Trim();
-            if (!string.IsNullOrWhiteSpace(phone))
-            {
-                var dupPhone = await _db.FinancialParties.AnyAsync(p => p.Phone == phone && p.Id != party.Id, ct);
-                if (dupPhone)
-                    return Result.Failure<bool>("رقم الهاتف مكرر — مستخدَم لدى طرف آخر");
-            }
-
-            var email = req.Email?.Trim();
-            if (!string.IsNullOrWhiteSpace(email))
-            {
-                var dupEmail = await _db.FinancialParties.AnyAsync(p => p.Email == email && p.Id != party.Id, ct);
-                if (dupEmail)
-                    return Result.Failure<bool>("البريد الإلكتروني مكرر — مستخدَم لدى طرف آخر");
-            }
-
             // ‎تحديث الحساب أولاً (مصدر الاسم الوحيد).
             party.Account.UpdateBasic(nameAr, req.NameEn, party.Account.Description);
 
@@ -78,6 +70,13 @@ public class UpdateFinancialPartyHandler
             if (req.IsActive) party.Activate(); else party.Deactivate();
 
             await _db.SaveChangesAsync(ct);
+
+            var sync = await _contacts.SyncOwnerAsync(
+                ContactOwnerTypes.FinancialParty, party.Id.ToString(),
+                req.Email, req.Phone, req.Mobile, ct);
+            if (!sync.Success)
+                return Result.Failure<bool>(sync.Error ?? "تعذّر حفظ جهات الاتصال");
+
             return Result.Success(true);
         }
         catch (DomainException ex) { return Result.Failure<bool>(ex.Message); }

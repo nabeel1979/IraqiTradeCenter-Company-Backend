@@ -72,6 +72,7 @@ public class AccountsController : BaseApiController
     }
 
     [HttpDelete("{id:int}")]
+    [RequirePermission(PermissionRegistry.Accounting.Accounts.Delete)]
     public async Task<IActionResult> Delete(int id)
         => HandleResult(await Mediator.Send(new DeleteAccountCommand(id)));
 
@@ -81,6 +82,7 @@ public class AccountsController : BaseApiController
 
     /// <summary>قائمة الحسابات الموجودة في سلة المهملات (محذوفة ناعماً).</summary>
     [HttpGet("trash")]
+    [RequirePermission(PermissionRegistry.System.Trash.Read)]
     public async Task<IActionResult> GetTrash()
     {
         var data = await Mediator.Send(new GetAccountsTrashQuery());
@@ -89,11 +91,13 @@ public class AccountsController : BaseApiController
 
     /// <summary>استعادة حساب من سلة المهملات (يعكس الحذف الناعم).</summary>
     [HttpPost("{id:int}/restore")]
+    [RequirePermission(PermissionRegistry.System.Trash.Restore)]
     public async Task<IActionResult> Restore(int id)
         => HandleResult(await Mediator.Send(new RestoreAccountCommand(id)));
 
     /// <summary>حذف نهائي للحساب من قاعدة البيانات. مسموح فقط من سلة المهملات.</summary>
     [HttpDelete("{id:int}/permanent")]
+    [RequirePermission(PermissionRegistry.System.Trash.Purge)]
     public async Task<IActionResult> PermanentlyDelete(int id)
         => HandleResult(await Mediator.Send(new PermanentlyDeleteAccountCommand(id)));
 
@@ -154,6 +158,7 @@ public class AccountsController : BaseApiController
     }
 
     [HttpDelete("journal-entries/{id:int}")]
+    [RequirePermission(PermissionRegistry.Accounting.JournalEntries.Delete)]
     public async Task<IActionResult> DeleteJournalEntry(int id)
         => HandleResult(await Mediator.Send(new DeleteJournalEntryCommand(id)));
 

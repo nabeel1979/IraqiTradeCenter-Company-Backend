@@ -8,7 +8,8 @@ public class MappingProfile : Profile
 {
     public MappingProfile()
     {
-        CreateMap<Item, ItemDto>();
+        CreateMap<Item, ItemDto>()
+            .ForMember(d => d.HasImage, o => o.MapFrom(s => s.MainImageStorageKey != null));
         CreateMap<StockMovement, StockMovementDto>()
             .ForMember(d => d.TypeName, o => o.MapFrom(s => s.Type.ToString()));
     }

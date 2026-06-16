@@ -24,6 +24,7 @@ public class ItemConfig : IEntityTypeConfiguration<Item>
         b.Property(x => x.StockBaseQuantity).HasColumnType("decimal(18,3)");
         b.Property(x => x.MinimumStockLevel).HasColumnType("decimal(18,3)");
         b.Property(x => x.MaximumStockLevel).HasColumnType("decimal(18,3)");
+        b.Property(x => x.MainImageStorageKey).HasMaxLength(500);
         b.Property(x => x.RowVersion).IsRowVersion();
         b.HasIndex(x => x.Code).IsUnique();
         b.HasIndex(x => x.Barcode);

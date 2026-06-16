@@ -2,6 +2,8 @@ using IraqiTradeCenterCompany.API.Auth;
 using IraqiTradeCenterCompany.API.Auth.Permissions;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
+using IraqiTradeCenterCompany.SharedKernel.Contacts;
+using IraqiTradeCenterCompany.SharedKernel.Interfaces;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -16,12 +18,21 @@ public class UsersController : ControllerBase
     private readonly AuthDbContext _db;
     private readonly IPermissionService _permissions;
     private readonly IAccountingDbContext _accountingDb;
+    private readonly IContactRegistry _contacts;
+    private readonly IResetCredentialLinkService _credentialLinks;
 
-    public UsersController(AuthDbContext db, IPermissionService permissions, IAccountingDbContext accountingDb)
+    public UsersController(
+        AuthDbContext db,
+        IPermissionService permissions,
+        IAccountingDbContext accountingDb,
+        IContactRegistry contacts,
+        IResetCredentialLinkService credentialLinks)
     {
         _db = db;
         _permissions = permissions;
         _accountingDb = accountingDb;
+        _contacts = contacts;
+        _credentialLinks = credentialLinks;
     }
 
     // ────────────────────────────────────────────────────────────
@@ -35,7 +46,12 @@ public class UsersController : ControllerBase
         if (!string.IsNullOrWhiteSpace(search))
         {
             var s = search.Trim();
-            q = q.Where(u => u.FullName.Contains(s) || u.Phone.Contains(s));
+            var userIdsFromContacts = _db.ContactPoints.AsNoTracking()
+                .Where(c => c.OwnerType == ContactOwnerTypes.User &&
+                            (c.DisplayValue.Contains(s) || c.NormalizedValue.Contains(s)))
+                .Select(c => c.OwnerId);
+            q = q.Where(u => u.FullName.Contains(s) || u.Phone.Contains(s) ||
+                             userIdsFromContacts.Contains(u.Id.ToString()));
         }
 
         var users = await q
@@ -52,7 +68,27 @@ public class UsersController : ControllerBase
             })
             .ToListAsync(ct);
 
-        return Ok(new { success = true, data = users });
+        var ids = users.Select(u => u.Id.ToString()).ToList();
+        var contactRows = await _db.ContactPoints.AsNoTracking()
+            .Where(c => c.OwnerType == ContactOwnerTypes.User && ids.Contains(c.OwnerId))
+            .ToListAsync(ct);
+        var contactsByUser = contactRows.GroupBy(c => c.OwnerId).ToDictionary(g => g.Key, g => g.ToList());
+
+        var data = users.Select(u =>
+        {
+            contactsByUser.TryGetValue(u.Id.ToString(), out var cc);
+            cc ??= [];
+            return new
+            {
+                u.Id, u.FullName, u.Phone, u.IsActive, u.MustChangePassword, u.CreatedAt,
+                u.hasAvatar, u.roles, u.cashBoxCount,
+                email = cc.FirstOrDefault(x => x.Kind == ContactKinds.Email)?.DisplayValue,
+                contactPhone = cc.FirstOrDefault(x => x.Kind == ContactKinds.Phone)?.DisplayValue,
+                mobile = cc.FirstOrDefault(x => x.Kind == ContactKinds.Mobile)?.DisplayValue,
+            };
+        });
+
+        return Ok(new { success = true, data });
     }
 
     [HttpGet("{id:guid}")]
@@ -79,6 +115,7 @@ public class UsersController : ControllerBase
 
         var effective = await _permissions.GetUserPermissionsAsync(id, ct);
         var isSuper   = await _permissions.IsSuperAdminAsync(id, ct);
+        var contacts  = await _contacts.GetForOwnerAsync(ContactOwnerTypes.User, id.ToString(), ct);
 
         return Ok(new
         {
@@ -87,6 +124,9 @@ public class UsersController : ControllerBase
             {
                 user.Id, user.FullName, user.Phone, user.IsActive, user.MustChangePassword, user.CreatedAt,
                 avatarBase64 = user.AvatarBase64,
+                email = contacts.FirstOrDefault(c => c.Kind == ContactKinds.Email)?.DisplayValue,
+                contactPhone = contacts.FirstOrDefault(c => c.Kind == ContactKinds.Phone)?.DisplayValue,
+                mobile = contacts.FirstOrDefault(c => c.Kind == ContactKinds.Mobile)?.DisplayValue,
                 roleIds = roles,
                 overrides,
                 cashBoxes,
@@ -104,10 +144,11 @@ public class UsersController : ControllerBase
     public async Task<IActionResult> Create([FromBody] UserCreateDto dto, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(dto.FullName) || string.IsNullOrWhiteSpace(dto.Phone) || string.IsNullOrWhiteSpace(dto.Password))
-            return BadRequest(new { success = false, errors = new[] { "الاسم ورقم الهاتف وكلمة المرور مطلوبة" } });
+            return BadRequest(new { success = false, errors = new[] { "الاسم واسم المستخدم وكلمة المرور مطلوبة" } });
 
-        if (await _db.Users.AnyAsync(u => u.Phone == dto.Phone, ct))
-            return Conflict(new { success = false, errors = new[] { "رقم الهاتف مستخدم لمستخدم آخر" } });
+        var loginName = dto.Phone.Trim();
+        if (await _db.Users.AnyAsync(u => u.Phone == loginName, ct))
+            return Conflict(new { success = false, errors = new[] { "اسم المستخدم مستخدم لمستخدم آخر" } });
 
         string? avatar = null;
         if (dto.AvatarBase64 != null)
@@ -121,7 +162,7 @@ public class UsersController : ControllerBase
         {
             Id           = Guid.NewGuid(),
             FullName     = dto.FullName.Trim(),
-            Phone        = dto.Phone.Trim(),
+            Phone        = loginName,
             PasswordHash = PasswordHelper.Hash(dto.Password),
             Role         = "User",
             IsActive     = dto.IsActive ?? true,
@@ -139,6 +180,12 @@ public class UsersController : ControllerBase
             await _db.SaveChangesAsync(ct);
         }
 
+        var sync = await _contacts.SyncOwnerAsync(
+            ContactOwnerTypes.User, user.Id.ToString(),
+            dto.Email, dto.ContactPhone, dto.Mobile, ct);
+        if (!sync.Success)
+            return Conflict(new { success = false, errors = new[] { sync.Error ?? "تعذّر حفظ جهات الاتصال" } });
+
         return Ok(new { success = true, data = new { user.Id } });
     }
 
@@ -154,7 +201,7 @@ public class UsersController : ControllerBase
         {
             var phone = dto.Phone.Trim();
             if (await _db.Users.AnyAsync(u => u.Phone == phone && u.Id != id, ct))
-                return Conflict(new { success = false, errors = new[] { "رقم الهاتف مستخدم لمستخدم آخر" } });
+                return Conflict(new { success = false, errors = new[] { "اسم المستخدم مستخدم لمستخدم آخر" } });
             user.Phone = phone;
         }
         if (!string.IsNullOrWhiteSpace(dto.Password))
@@ -175,6 +222,13 @@ public class UsersController : ControllerBase
         }
 
         await _db.SaveChangesAsync(ct);
+
+        var syncUpdate = await _contacts.SyncOwnerAsync(
+            ContactOwnerTypes.User, id.ToString(),
+            dto.Email, dto.ContactPhone, dto.Mobile, ct);
+        if (!syncUpdate.Success)
+            return Conflict(new { success = false, errors = new[] { syncUpdate.Error ?? "تعذّر حفظ جهات الاتصال" } });
+
         _permissions.InvalidateUser(id);
         return Ok(new { success = true });
     }
@@ -193,6 +247,8 @@ public class UsersController : ControllerBase
         await _db.SaveChangesAsync(ct);
         _permissions.InvalidateUser(id);
 
+        var links = _credentialLinks.Create(user.Phone, temporaryPassword);
+
         return Ok(new
         {
             success = true,
@@ -200,6 +256,9 @@ public class UsersController : ControllerBase
             {
                 temporaryPassword,
                 mustChangePassword = true,
+                credentialsUrl = links.ViewUrl,
+                credentialsUrlCopyUsername = links.ViewUrlCopyUsername,
+                credentialsUrlCopyPassword = links.ViewUrlCopyPassword,
             }
         });
     }
@@ -391,8 +450,12 @@ public class UsersController : ControllerBase
     }
 }
 
-public record UserCreateDto(string FullName, string Phone, string Password, bool? IsActive, IList<int>? RoleIds, bool? MustChangePassword, string? AvatarBase64);
-public record UserUpdateDto(string? FullName, string? Phone, string? Password, bool? IsActive, bool? MustChangePassword, string? AvatarBase64);
+public record UserCreateDto(
+    string FullName, string Phone, string Password, bool? IsActive, IList<int>? RoleIds,
+    bool? MustChangePassword, string? AvatarBase64, string? Email, string? ContactPhone, string? Mobile);
+public record UserUpdateDto(
+    string? FullName, string? Phone, string? Password, bool? IsActive, bool? MustChangePassword,
+    string? AvatarBase64, string? Email, string? ContactPhone, string? Mobile);
 public record SetRolesDto(IList<int>? RoleIds);
 public record OverrideEntryDto(string PermissionCode, bool IsGranted);
 public record SetOverridesDto(IList<OverrideEntryDto>? Overrides);

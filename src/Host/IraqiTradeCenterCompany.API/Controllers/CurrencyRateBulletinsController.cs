@@ -1,3 +1,4 @@
+using IraqiTradeCenterCompany.API.Auth.Permissions;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Dtos;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.CurrencyRates;
 using Microsoft.AspNetCore.Mvc;
@@ -84,6 +85,7 @@ public class CurrencyRateBulletinsController : BaseApiController
     }
 
     [HttpDelete("{id:int}")]
+    [RequirePermission(PermissionRegistry.Accounting.CurrencyRates.Delete)]
     public async Task<IActionResult> Delete(int id)
     {
         var r = await Mediator.Send(new DeleteCurrencyRateBulletinCommand(id));

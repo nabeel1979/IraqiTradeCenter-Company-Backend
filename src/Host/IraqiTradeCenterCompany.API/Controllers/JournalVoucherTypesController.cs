@@ -97,6 +97,7 @@ public class JournalVoucherTypesController : BaseApiController
     }
 
     [HttpDelete("{id:int}")]
+    [RequirePermission(PermissionRegistry.Accounting.VoucherTypes.Delete)]
     public async Task<IActionResult> Delete(int id)
     {
         try

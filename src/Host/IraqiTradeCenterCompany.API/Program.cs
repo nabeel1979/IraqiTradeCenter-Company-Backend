@@ -19,6 +19,7 @@ using IraqiTradeCenterCompany.Modules.Store.Infrastructure;
 using IraqiTradeCenterCompany.Modules.Store.Infrastructure.Persistence;
 using IraqiTradeCenterCompany.SharedKernel.Behaviors;
 using IraqiTradeCenterCompany.SharedKernel.Interfaces;
+using IContactRegistry = IraqiTradeCenterCompany.SharedKernel.Interfaces.IContactRegistry;
 using MediatR;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
@@ -64,6 +65,11 @@ builder.Services.Configure<LoginSecurityOptions>(
     builder.Configuration.GetSection(LoginSecurityOptions.SectionName));
 // قفل حساب مؤقت ضد هجمات تخمين كلمة المرور (يعتمد على IMemoryCache أعلاه)
 builder.Services.AddSingleton<ILoginThrottle, LoginThrottle>();
+builder.Services.Configure<IraqiTradeCenterCompany.API.Integration.ParentIntegrationOptions>(
+    builder.Configuration.GetSection(IraqiTradeCenterCompany.API.Integration.ParentIntegrationOptions.SectionName));
+builder.Services.AddSingleton<IResetCredentialViewCache, ResetCredentialViewCache>();
+builder.Services.AddSingleton<IResetCredentialLinkService, ResetCredentialLinkService>();
+builder.Services.AddScoped<IForgotPasswordService, ForgotPasswordService>();
 builder.Services.AddScoped<IPermissionService, PermissionService>();
 builder.Services.AddScoped<IVoucherTypePermissionsSync, VoucherTypePermissionsSync>();
 builder.Services.AddUnifiedTrash();
@@ -110,6 +116,13 @@ builder.Services.AddScoped<IraqiTradeCenterCompany.API.Attachments.VoucherAttach
 builder.Services.AddHostedService<IraqiTradeCenterCompany.API.Attachments.AttachmentSyncBackgroundService>();
 // ‎جدولة النسخ الاحتياطي لقاعدة البيانات (حسب AutoBackupCron).
 builder.Services.AddHostedService<IraqiTradeCenterCompany.API.Settings.MediaBackupBackgroundService>();
+
+// ‎إعدادات البريد (Zoho SMTP) للفواتير الإلكترونية ورسائل الاختبار.
+builder.Services.AddScoped<IraqiTradeCenterCompany.API.Settings.IEmailSettingsService,
+    IraqiTradeCenterCompany.API.Settings.EmailSettingsService>();
+builder.Services.AddScoped<IraqiTradeCenterCompany.API.Settings.IEmailSmtpSender,
+    IraqiTradeCenterCompany.API.Settings.EmailSmtpSender>();
+builder.Services.AddScoped<IContactRegistry, IraqiTradeCenterCompany.API.ContactRegistry.ContactRegistryService>();
 
 // 5) Controllers
 builder.Services.AddControllers();
@@ -168,19 +181,34 @@ builder.Services.AddRateLimiter(options =>
     };
 });
 
-// 7) CORS — في Development يسمح لكل الأصول، في Production يقرأ القائمة من الإعدادات
-var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>();
+// 7) CORS — في Development يسمح لكل الأصول، في Production يدعم قائمة الأصول + wildcard subdomains
+var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+var allowedWildcardDomains = builder.Configuration
+    .GetSection("Cors:AllowedWildcardDomains").Get<string[]>()
+    ?? ["iraqi-trade-center.iq", "gcc.iq"];
+
 builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("AllowAll", p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
-    if (allowedOrigins is { Length: > 0 })
+    opt.AddPolicy("AllowFrontends", p =>
     {
-        opt.AddPolicy("AllowFrontends", p =>
-            p.WithOrigins(allowedOrigins)
-             .AllowAnyMethod()
-             .AllowAnyHeader()
-             .AllowCredentials());
-    }
+        p.AllowAnyMethod()
+         .AllowAnyHeader()
+         .AllowCredentials()
+         .SetIsOriginAllowed(origin =>
+         {
+             if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)) return false;
+             var host = uri.Host;
+             // أصول محددة
+             if (allowedOrigins.Contains(origin, StringComparer.OrdinalIgnoreCase)) return true;
+             // wildcard subdomains
+             foreach (var domain in allowedWildcardDomains)
+                 if (host.Equals(domain, StringComparison.OrdinalIgnoreCase) ||
+                     host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase))
+                     return true;
+             return false;
+         });
+    });
 });
 
 // 8) Swagger
@@ -271,7 +299,10 @@ app.UseMiddleware<ExceptionHandlingMiddleware>();
 // HTTPS redirect: يعمل فقط في Development — في Production يدير IIS الـ SSL
 if (app.Environment.IsDevelopment())
     app.UseHttpsRedirection();
-var corsPolicy = allowedOrigins is { Length: > 0 } ? "AllowFrontends" : "AllowAll";
+// في Development بدون إعدادات يُستخدم AllowAll، وإلا AllowFrontends مع wildcard support
+var corsPolicy = app.Environment.IsDevelopment() && allowedOrigins.Length == 0 && allowedWildcardDomains.Length == 0
+    ? "AllowAll"
+    : "AllowFrontends";
 app.UseCors(corsPolicy);
 app.UseAuthentication();
 app.UseAuthorization();

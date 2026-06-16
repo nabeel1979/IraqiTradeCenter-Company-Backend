@@ -1,3 +1,4 @@
+using IraqiTradeCenterCompany.API.Auth.Permissions;
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Features.FiscalYearManagement;
 using IraqiTradeCenterCompany.SharedKernel.Exceptions;
 using Microsoft.AspNetCore.Mvc;
@@ -97,6 +98,7 @@ public class FiscalYearsController : BaseApiController
     }
 
     [HttpDelete("{id:int}")]
+    [RequirePermission(PermissionRegistry.Accounting.FiscalYears.Delete)]
     public async Task<IActionResult> Delete(int id)
     {
         try

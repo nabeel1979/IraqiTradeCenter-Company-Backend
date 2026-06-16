@@ -11,6 +11,8 @@ public class ItemDto
     public decimal StockBaseQuantity { get; set; }
     public decimal MinimumStockLevel { get; set; }
     public bool IsAvailableForSale { get; set; }
+    public bool ShowInStore { get; set; }
+    public bool HasImage { get; set; }
     public bool IsLowStock => StockBaseQuantity <= MinimumStockLevel;
 }
 

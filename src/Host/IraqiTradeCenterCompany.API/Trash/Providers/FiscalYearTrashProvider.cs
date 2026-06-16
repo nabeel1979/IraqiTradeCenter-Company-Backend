@@ -51,14 +51,39 @@ public class FiscalYearTrashProvider : ITrashProvider
         if (fy is null) return Result.Failure("السنة المالية غير موجودة");
         if (!fy.IsDeleted) return Result.Failure("الحذف النهائي مسموح فقط من السلة");
 
-        var refByEntry = await _db.JournalEntries.IgnoreQueryFilters()
-            .AnyAsync(e => e.FiscalYearId == id, ct);
-        if (refByEntry)
-            return Result.Failure("لا يمكن الحذف النهائي — هناك قيود مرتبطة (نشطة أو محذوفة).");
+        // 1) سطور القيود المحاسبية
+        var entryIds = await _db.JournalEntries.IgnoreQueryFilters()
+            .Where(e => e.FiscalYearId == id)
+            .Select(e => e.Id)
+            .ToListAsync(ct);
 
+        if (entryIds.Count > 0)
+        {
+            // مرفقات السندات
+            var attachments = await _db.VoucherAttachments.IgnoreQueryFilters()
+                .Where(a => entryIds.Contains(a.JournalEntryId))
+                .ToListAsync(ct);
+            _db.VoucherAttachments.RemoveRange(attachments);
+
+            // سطور القيود
+            var lines = await _db.JournalEntryLines.IgnoreQueryFilters()
+                .Where(l => entryIds.Contains(l.JournalEntryId))
+                .ToListAsync(ct);
+            _db.JournalEntryLines.RemoveRange(lines);
+
+            // القيود نفسها
+            var entries = await _db.JournalEntries.IgnoreQueryFilters()
+                .Where(e => entryIds.Contains(e.Id))
+                .ToListAsync(ct);
+            _db.JournalEntries.RemoveRange(entries);
+        }
+
+        // 2) الفترات المحاسبية
         var periods = await _db.AccountingPeriods.IgnoreQueryFilters()
             .Where(p => p.FiscalYearId == id).ToListAsync(ct);
         _db.AccountingPeriods.RemoveRange(periods);
+
+        // 3) السنة المالية
         _db.FiscalYears.Remove(fy);
         await _db.SaveChangesAsync(ct);
         return Result.Success();

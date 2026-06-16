@@ -20,14 +20,19 @@ public class AuthController : ControllerBase
     private readonly IConfiguration _config;
     private readonly IPermissionService _permissions;
     private readonly ILoginThrottle _throttle;
+    private readonly IForgotPasswordService _forgotPassword;
+    private readonly IResetCredentialViewCache _resetView;
 
     public AuthController(AuthDbContext db, IConfiguration config, IPermissionService permissions,
-        ILoginThrottle throttle)
+        ILoginThrottle throttle, IForgotPasswordService forgotPassword,
+        IResetCredentialViewCache resetView)
     {
         _db = db;
         _config = config;
         _permissions = permissions;
         _throttle = throttle;
+        _forgotPassword = forgotPassword;
+        _resetView = resetView;
     }
 
     [HttpPost("login")]
@@ -96,6 +101,42 @@ public class AuthController : ControllerBase
 
         var payload = await BuildAuthPayloadAsync(user);
         return Ok(new { success = true, data = payload });
+    }
+
+    [HttpPost("forgot-password")]
+    [EnableRateLimiting("login")]
+    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest req, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(req.Username))
+            return BadRequest(new { success = false, errors = new[] { "اسم المستخدم مطلوب" } });
+
+        var (ok, errors) = await _forgotPassword.SendTemporaryPasswordAsync(req.Username, ct);
+        if (!ok)
+            return BadRequest(new { success = false, errors });
+
+        return Ok(new
+        {
+            success = true,
+            data = new
+            {
+                message = "تم إرسال كلمة مرور مؤقتة إلى بريدك المسجّل. سجّل الدخول ثم عيّن كلمة مرور جديدة."
+            }
+        });
+    }
+
+    [HttpGet("reset-credentials/{token}")]
+    [EnableRateLimiting("login")]
+    public IActionResult GetResetCredentials(string token)
+    {
+        var payload = _resetView.TryGet(token);
+        if (payload is null)
+            return NotFound(new { success = false, errors = new[] { "الرابط منتهٍ أو غير صالح — اطلب إعادة تعيين جديدة من صفحة الدخول" } });
+
+        return Ok(new
+        {
+            success = true,
+            data = new { username = payload.Username, password = payload.Password }
+        });
     }
 
     private async Task<object> BuildAuthPayloadAsync(CompanyUser user)
@@ -170,3 +211,4 @@ public class AuthController : ControllerBase
 
 public record LoginRequest(string Phone, string Password);
 public record ChangePasswordRequest(string CurrentPassword, string NewPassword);
+public record ForgotPasswordRequest(string Username);

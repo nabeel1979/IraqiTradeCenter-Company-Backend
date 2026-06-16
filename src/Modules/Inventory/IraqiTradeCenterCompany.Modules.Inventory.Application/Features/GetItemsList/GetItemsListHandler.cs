@@ -24,6 +24,7 @@ public class GetItemsListHandler : IRequestHandler<GetItemsListQuery, PagedResul
         }
         if (req.CategoryId.HasValue) q = q.Where(i => i.CategoryId == req.CategoryId);
         if (req.LowStockOnly == true) q = q.Where(i => i.StockBaseQuantity <= i.MinimumStockLevel);
+        if (req.ShowInStoreOnly == true) q = q.Where(i => i.ShowInStore);
 
         var total = await q.CountAsync(ct);
         var items = await q.OrderBy(i => i.NameAr)

@@ -7,8 +7,11 @@ public interface ITrashService
     Task<List<TrashItemDto>> ListAllAsync(CancellationToken ct);
     Task<Result> RestoreAsync(string entityType, int id, CancellationToken ct);
     Task<Result> PermanentlyDeleteAsync(string entityType, int id, CancellationToken ct);
+    Task<PurgeAllResult> PurgeAllAsync(string? entityType, CancellationToken ct);
     IReadOnlyList<string> SupportedEntityTypes { get; }
 }
+
+public sealed record PurgeAllResult(int Deleted, int Failed, List<string> Errors);
 
 /// <summary>
 /// واجهة موحَّدة لسلّة المهملات عبر النظام بأكمله — تُجمّع كل المُزوِّدين المسجَّلين
@@ -73,5 +76,38 @@ public class TrashService : ITrashService
         if (!_providers.TryGetValue(entityType, out var p))
             return Task.FromResult(Result.Failure($"نوع غير معروف: {entityType}"));
         return p.PermanentlyDeleteAsync(id, ct);
+    }
+
+    public async Task<PurgeAllResult> PurgeAllAsync(string? entityType, CancellationToken ct)
+    {
+        // جلب العناصر المراد حذفها (كل السلة أو نوع معين)
+        var allItems = await ListAllAsync(ct);
+        var targets = string.IsNullOrWhiteSpace(entityType)
+            ? allItems
+            : allItems.Where(i => string.Equals(i.EntityType, entityType, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        // استثناء عناصر الأخطاء وعناصر canPurge = false
+        targets = targets.Where(i => i.EntityId != 0 && i.CanPurge != false).ToList();
+
+        int deleted = 0, failed = 0;
+        var errors = new List<string>();
+
+        foreach (var item in targets)
+        {
+            if (!_providers.TryGetValue(item.EntityType, out var p))
+            {
+                failed++;
+                errors.Add($"نوع غير معروف: {item.EntityType}");
+                continue;
+            }
+            var result = await p.PermanentlyDeleteAsync(item.EntityId, ct);
+            if (result.IsSuccess) deleted++;
+            else
+            {
+                failed++;
+                errors.Add($"{item.DisplayName}: {string.Join(", ", result.Errors)}");
+            }
+        }
+        return new PurgeAllResult(deleted, failed, errors);
     }
 }

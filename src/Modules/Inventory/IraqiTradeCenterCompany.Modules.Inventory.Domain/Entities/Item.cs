@@ -30,6 +30,8 @@ public class Item : BaseEntity
 
     public bool IsActive { get; private set; }
     public bool IsAvailableForSale { get; private set; }
+    public bool ShowInStore { get; private set; }
+    public string? MainImageStorageKey { get; private set; }
     public byte[]? RowVersion { get; private set; }
 
     private Item() { }
@@ -45,7 +47,7 @@ public class Item : BaseEntity
             Code = code, Barcode = barcode, NameAr = nameAr,
             BaseUnitId = baseUnitId,
             PurchasePrice = purchasePrice, BaseSalesPrice = baseSalesPrice,
-            IsActive = true, IsAvailableForSale = true
+            IsActive = true, IsAvailableForSale = true, ShowInStore = false
         };
     }
 
@@ -73,6 +75,9 @@ public class Item : BaseEntity
 
     public void SetStockLevels(decimal min, decimal max) { MinimumStockLevel = min; MaximumStockLevel = max; }
     public void SetOpeningStock(decimal q) => StockBaseQuantity = q;
+    public void SetShowInStore(bool show) => ShowInStore = show;
+    public void SetMainImage(string storageKey) => MainImageStorageKey = storageKey;
+    public void RemoveMainImage() => MainImageStorageKey = null;
 
     public decimal ConvertToBase(int unitId, decimal quantity)
     {

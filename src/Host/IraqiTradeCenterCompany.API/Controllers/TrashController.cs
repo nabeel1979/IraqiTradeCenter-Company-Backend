@@ -39,4 +39,25 @@ public class TrashController : BaseApiController
     [RequirePermission(PermissionRegistry.System.Trash.Purge)]
     public async Task<IActionResult> Purge(string entityType, int id, CancellationToken ct)
         => HandleResult(await _trash.PermanentlyDeleteAsync(entityType, id, ct));
+
+    /// <summary>
+    /// مسح كل محتويات السلة (أو نوع محدد) دفعةً واحدة.
+    /// يحتاج نفس صلاحية الحذف النهائي: System.Trash.Purge
+    /// </summary>
+    [HttpDelete("purge-all")]
+    [RequirePermission(PermissionRegistry.System.Trash.Purge)]
+    public async Task<IActionResult> PurgeAll([FromQuery] string? entityType, CancellationToken ct)
+    {
+        var result = await _trash.PurgeAllAsync(entityType, ct);
+        return Ok(new
+        {
+            success = true,
+            data = new
+            {
+                deleted = result.Deleted,
+                failed  = result.Failed,
+                errors  = result.Errors,
+            },
+        });
+    }
 }

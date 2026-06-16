@@ -1,6 +1,7 @@
 using IraqiTradeCenterCompany.API.Auth.Auditing;
 using IraqiTradeCenterCompany.API.Auth.Notifications;
 using IraqiTradeCenterCompany.API.Auth.Permissions;
+using IraqiTradeCenterCompany.API.ContactRegistry;
 using IraqiTradeCenterCompany.API.Settings;
 using Microsoft.EntityFrameworkCore;
 
@@ -31,6 +32,8 @@ public class AuthDbContext : DbContext
     // ── Attachment storage settings (singleton row)
     public DbSet<AttachmentStorageSettings> AttachmentStorageSettings => Set<AttachmentStorageSettings>();
     public DbSet<MediaBackupSettings> MediaBackupSettings => Set<MediaBackupSettings>();
+    public DbSet<EmailSettings> EmailSettings => Set<EmailSettings>();
+    public DbSet<ContactPoint> ContactPoints => Set<ContactPoint>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -198,6 +201,36 @@ public class AuthDbContext : DbContext
             e.Property(x => x.SyncDatabaseBackupToR2).HasDefaultValue(false);
             e.Property(x => x.ServerDatabaseBackupKeepCount).HasDefaultValue(3);
             e.Property(x => x.R2DatabaseBackupKeepCount).HasDefaultValue(10);
+        });
+
+        modelBuilder.Entity<ContactPoint>(e =>
+        {
+            e.ToTable("ContactPoints", "auth");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Kind).HasMaxLength(20).IsRequired();
+            e.Property(x => x.NormalizedValue).HasMaxLength(200).IsRequired();
+            e.Property(x => x.DisplayValue).HasMaxLength(200).IsRequired();
+            e.Property(x => x.OwnerType).HasMaxLength(30).IsRequired();
+            e.Property(x => x.OwnerId).HasMaxLength(50).IsRequired();
+            e.HasIndex(x => new { x.Kind, x.NormalizedValue }).IsUnique();
+            e.HasIndex(x => new { x.OwnerType, x.OwnerId });
+        });
+
+        modelBuilder.Entity<EmailSettings>(e =>
+        {
+            e.ToTable("EmailSettings", "auth");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedNever();
+            e.Property(x => x.Provider).HasMaxLength(20).IsRequired().HasDefaultValue("Zoho");
+            e.Property(x => x.SmtpHost).HasMaxLength(200).IsRequired().HasDefaultValue("smtp.zoho.com");
+            e.Property(x => x.SecurityMode).HasMaxLength(20).IsRequired().HasDefaultValue("StartTls");
+            e.Property(x => x.Username).HasMaxLength(200);
+            e.Property(x => x.AppPassword).HasMaxLength(500);
+            e.Property(x => x.FromEmail).HasMaxLength(200);
+            e.Property(x => x.FromDisplayName).HasMaxLength(200);
+            e.Property(x => x.ReplyToEmail).HasMaxLength(200);
+            e.Property(x => x.SignatureHtml).HasColumnType("nvarchar(max)");
+            e.Property(x => x.UpdatedBy).HasMaxLength(100);
         });
 
         modelBuilder.Entity<Currency>(e =>

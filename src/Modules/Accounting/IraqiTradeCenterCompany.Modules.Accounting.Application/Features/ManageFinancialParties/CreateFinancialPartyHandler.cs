@@ -1,7 +1,9 @@
 using IraqiTradeCenterCompany.Modules.Accounting.Application.Persistence;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Enums;
 using IraqiTradeCenterCompany.Modules.Accounting.Domain.Entities;
+using IraqiTradeCenterCompany.SharedKernel.Contacts;
 using IraqiTradeCenterCompany.SharedKernel.Exceptions;
+using IraqiTradeCenterCompany.SharedKernel.Interfaces;
 using IraqiTradeCenterCompany.SharedKernel.Models;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
@@ -12,7 +14,13 @@ public class CreateFinancialPartyHandler
     : IRequestHandler<CreateFinancialPartyCommand, Result<int>>
 {
     private readonly IAccountingDbContext _db;
-    public CreateFinancialPartyHandler(IAccountingDbContext db) => _db = db;
+    private readonly IContactRegistry _contacts;
+
+    public CreateFinancialPartyHandler(IAccountingDbContext db, IContactRegistry contacts)
+    {
+        _db = db;
+        _contacts = contacts;
+    }
 
     public async Task<Result<int>> Handle(CreateFinancialPartyCommand req, CancellationToken ct)
     {
@@ -45,22 +53,6 @@ public class CreateFinancialPartyHandler
                     .AnyAsync(a => a.ParentId == category.MainAccountId && a.NameEn == nameEn, ct);
                 if (dupNameEn)
                     return Result.Failure<int>("الاسم الإنجليزي مكرر في هذا النوع — استخدم اسماً مختلفاً");
-            }
-
-            var phone = req.Phone?.Trim();
-            if (!string.IsNullOrWhiteSpace(phone))
-            {
-                var dupPhone = await _db.FinancialParties.AnyAsync(p => p.Phone == phone, ct);
-                if (dupPhone)
-                    return Result.Failure<int>("رقم الهاتف مكرر — مستخدَم لدى طرف آخر");
-            }
-
-            var email = req.Email?.Trim();
-            if (!string.IsNullOrWhiteSpace(email))
-            {
-                var dupEmail = await _db.FinancialParties.AnyAsync(p => p.Email == email, ct);
-                if (dupEmail)
-                    return Result.Failure<int>("البريد الإلكتروني مكرر — مستخدَم لدى طرف آخر");
             }
 
             // توليد كود حساب فريد: {كود_الحساب_الرئيسي}_{6 أرقام عشوائية}
@@ -102,6 +94,13 @@ public class CreateFinancialPartyHandler
 
             await _db.FinancialParties.AddAsync(party, ct);
             await _db.SaveChangesAsync(ct);
+
+            var sync = await _contacts.SyncOwnerAsync(
+                ContactOwnerTypes.FinancialParty, party.Id.ToString(),
+                req.Email, req.Phone, req.Mobile, ct);
+            if (!sync.Success)
+                return Result.Failure<int>(sync.Error ?? "تعذّر حفظ جهات الاتصال");
+
             return Result.Success(party.Id);
         }
         catch (DomainException ex) { return Result.Failure<int>(ex.Message); }

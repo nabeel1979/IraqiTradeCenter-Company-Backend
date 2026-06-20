@@ -65,7 +65,8 @@ public class UpdateFinancialPartyHandler
                 req.Phone, req.Mobile, req.Email,
                 req.Address, req.ContactPerson, req.Notes,
                 req.BankAccountNumber, req.SwiftCode, req.AddressEn,
-                party.Category.Kind.IsBankLike() ? req.CurrencyIbans : null);
+                party.Category.Kind.IsBankLike() ? req.CurrencyIbans : null,
+                req.SalesDiscountEnabled, req.SalesDiscountPercentage);
 
             if (req.IsActive) party.Activate(); else party.Deactivate();
 

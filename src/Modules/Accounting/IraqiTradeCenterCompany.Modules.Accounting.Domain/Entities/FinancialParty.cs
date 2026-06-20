@@ -44,6 +44,12 @@ public class FinancialParty : BaseEntity
     /// <summary>رمز السويفت (SWIFT/BIC) — يُستخدم لأطراف نوع المصرف.</summary>
     public string? SwiftCode       { get; private set; }
 
+    /// <summary>تفعيل نسبة خصم مبيعات افتراضية تُجلب تلقائياً في فاتورة المبيعات لهذا الطرف.</summary>
+    public bool SalesDiscountEnabled { get; private set; }
+
+    /// <summary>نسبة خصم المبيعات الافتراضية (%) — تُطبَّق فقط عند تفعيلها.</summary>
+    public decimal SalesDiscountPercentage { get; private set; }
+
     public bool IsActive { get; private set; }
 
     public virtual FinancialPartyCategory Category { get; private set; } = default!;
@@ -58,7 +64,8 @@ public class FinancialParty : BaseEntity
         string? phone, string? mobile, string? email,
         string? address, string? contactPerson, string? notes,
         string? bankAccountNumber = null, string? swiftCode = null, string? addressEn = null,
-        IReadOnlyDictionary<string, string>? currencyIbans = null)
+        IReadOnlyDictionary<string, string>? currencyIbans = null,
+        bool salesDiscountEnabled = false, decimal salesDiscountPercentage = 0m)
     {
         return new FinancialParty
         {
@@ -76,6 +83,8 @@ public class FinancialParty : BaseEntity
             Notes            = notes?.Trim(),
             BankAccountNumber = string.IsNullOrWhiteSpace(bankAccountNumber) ? null : bankAccountNumber.Trim(),
             SwiftCode        = string.IsNullOrWhiteSpace(swiftCode) ? null : swiftCode.Trim(),
+            SalesDiscountEnabled    = salesDiscountEnabled,
+            SalesDiscountPercentage = NormalizeDiscount(salesDiscountEnabled, salesDiscountPercentage),
             IsActive         = true,
         };
     }
@@ -86,7 +95,8 @@ public class FinancialParty : BaseEntity
         string? phone, string? mobile, string? email,
         string? address, string? contactPerson, string? notes,
         string? bankAccountNumber = null, string? swiftCode = null, string? addressEn = null,
-        IReadOnlyDictionary<string, string>? currencyIbans = null)
+        IReadOnlyDictionary<string, string>? currencyIbans = null,
+        bool salesDiscountEnabled = false, decimal salesDiscountPercentage = 0m)
     {
         CreditLimits      = SerializeCreditLimits(creditLimits);
         AllowedCurrencies = SerializeCurrencies(allowedCurrencies);
@@ -100,6 +110,17 @@ public class FinancialParty : BaseEntity
         Notes             = notes?.Trim();
         BankAccountNumber = string.IsNullOrWhiteSpace(bankAccountNumber) ? null : bankAccountNumber.Trim();
         SwiftCode         = string.IsNullOrWhiteSpace(swiftCode) ? null : swiftCode.Trim();
+        SalesDiscountEnabled    = salesDiscountEnabled;
+        SalesDiscountPercentage = NormalizeDiscount(salesDiscountEnabled, salesDiscountPercentage);
+    }
+
+    /// <summary>تُبقي النسبة ضمن [0..100]، وتُصفّرها عند تعطيل الخصم.</summary>
+    private static decimal NormalizeDiscount(bool enabled, decimal pct)
+    {
+        if (!enabled) return 0m;
+        if (pct < 0m) return 0m;
+        if (pct > 100m) return 100m;
+        return pct;
     }
 
     public void Activate()   => IsActive = true;

@@ -90,7 +90,8 @@ public class CreateFinancialPartyHandler
                 req.Phone, req.Mobile, req.Email,
                 req.Address, req.ContactPerson, req.Notes,
                 req.BankAccountNumber, req.SwiftCode, req.AddressEn,
-                category.Kind.IsBankLike() ? req.CurrencyIbans : null);
+                category.Kind.IsBankLike() ? req.CurrencyIbans : null,
+                req.SalesDiscountEnabled, req.SalesDiscountPercentage);
 
             await _db.FinancialParties.AddAsync(party, ct);
             await _db.SaveChangesAsync(ct);

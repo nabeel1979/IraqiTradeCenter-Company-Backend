@@ -62,6 +62,10 @@ public class FinancialPartyDto
     public string? BankAccountNumber  { get; set; }
     /// <summary>رمز السويفت (SWIFT/BIC) — خاص بأطراف نوع المصرف.</summary>
     public string? SwiftCode          { get; set; }
+    /// <summary>تفعيل نسبة خصم مبيعات افتراضية تُجلب في الفاتورة.</summary>
+    public bool SalesDiscountEnabled  { get; set; }
+    /// <summary>نسبة خصم المبيعات الافتراضية (%).</summary>
+    public decimal SalesDiscountPercentage { get; set; }
     public bool IsActive              { get; set; }
     public DateTime CreatedAt         { get; set; }
 }

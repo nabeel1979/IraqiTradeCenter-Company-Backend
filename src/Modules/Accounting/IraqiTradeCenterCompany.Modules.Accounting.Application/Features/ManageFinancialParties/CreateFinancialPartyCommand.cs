@@ -19,5 +19,7 @@ public record CreateFinancialPartyCommand(
     string? ContactPerson,
     string? Notes,
     string? BankAccountNumber,
-    string? SwiftCode
+    string? SwiftCode,
+    bool SalesDiscountEnabled = false,
+    decimal SalesDiscountPercentage = 0m
 ) : IRequest<Result<int>>;

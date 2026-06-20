@@ -64,6 +64,8 @@ public class GetFinancialPartiesHandler
             Notes            = p.Notes,
             BankAccountNumber = p.BankAccountNumber,
             SwiftCode        = p.SwiftCode,
+            SalesDiscountEnabled    = p.SalesDiscountEnabled,
+            SalesDiscountPercentage = p.SalesDiscountPercentage,
             IsActive         = p.IsActive,
             CreatedAt        = p.CreatedAt,
         }).ToList();

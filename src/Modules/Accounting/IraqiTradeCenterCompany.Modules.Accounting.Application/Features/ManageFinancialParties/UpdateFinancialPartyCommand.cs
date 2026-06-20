@@ -20,5 +20,7 @@ public record UpdateFinancialPartyCommand(
     string? Notes,
     string? BankAccountNumber,
     string? SwiftCode,
-    bool IsActive
+    bool IsActive,
+    bool SalesDiscountEnabled = false,
+    decimal SalesDiscountPercentage = 0m
 ) : IRequest<Result<bool>>;

@@ -23,6 +23,8 @@ public class FinancialPartyConfig : IEntityTypeConfiguration<FinancialParty>
         b.Property(x => x.Notes).HasMaxLength(1000);
         b.Property(x => x.BankAccountNumber).HasMaxLength(64);
         b.Property(x => x.SwiftCode).HasMaxLength(32);
+        b.Property(x => x.SalesDiscountEnabled).HasDefaultValue(false).IsRequired();
+        b.Property(x => x.SalesDiscountPercentage).HasColumnType("decimal(5,2)").HasDefaultValue(0m).IsRequired();
         b.Property(x => x.IsActive).HasDefaultValue(true).IsRequired();
 
         // ‎كل طرف يقابل حساباً واحداً فقط — نمنع التكرار على مستوى الحساب.

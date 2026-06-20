@@ -19,6 +19,7 @@ public static class TrashExtensions
         services.AddScoped<ITrashProvider, JournalVoucherTypeTrashProvider>();
         services.AddScoped<ITrashProvider, FiscalYearTrashProvider>();
         services.AddScoped<ITrashProvider, CurrencyRateBulletinTrashProvider>();
+        services.AddScoped<ITrashProvider, FinancialPartyTrashProvider>();
 
         return services;
     }
